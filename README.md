@@ -59,3 +59,4 @@ Never commit environment secrets or the Supabase service-role key to GitHub.
 Developed as part of a hackathon challenge focused on unlocking underused equipment and spaces.
 
 Further testing and deployment validation are in progress.
+<!-- Netlify deployment test -->
