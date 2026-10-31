@@ -574,6 +574,7 @@ function App() {
     setFormBusy(true);
 
     try {
+      const isAdmin = profile?.role === "admin";
       const { error } = await supabase
         .from("resources")
         .insert({
@@ -583,8 +584,8 @@ function App() {
           location: resourceForm.location.trim(),
           category_id: resourceForm.category_id || null,
           image_url: resourceForm.image_url.trim() || null,
-          source: "student",
-          approval_status: "pending",
+          source: isAdmin ? "college" : "student",
+          approval_status: isAdmin ? "approved" : "pending",
           availability_status: resourceForm.availability_status,
           usage_rules: resourceForm.usage_rules.trim() || null,
           eligibility_requirements: resourceForm.eligibility_requirements.trim() || null,
@@ -595,10 +596,14 @@ function App() {
       if (error) throw error;
 
       setFormMessage(
-        "Your resource has been submitted and is awaiting admin approval."
+        isAdmin
+          ? "Your resource listing has been published and is immediately available."
+          : "Your resource has been submitted and is awaiting admin approval."
       );
 
       setResourceForm(emptyResourceForm);
+      await fetchMyListings();
+      await fetchResources();
     } catch (err) {
       setFormError(err.message);
     } finally {
@@ -657,7 +662,7 @@ function App() {
           eligibility_requirements: resourceForm.eligibility_requirements.trim() || null,
           max_active_bookings: Math.max(1, Number(resourceForm.max_active_bookings) || 2),
           max_booking_hours: Math.max(1, Number(resourceForm.max_booking_hours) || 4),
-          approval_status: "pending"
+          approval_status: profile?.role === "admin" ? "approved" : "pending"
         })
         .eq("id", editingResource.id)
         .eq("owner_id", session.user.id);
@@ -666,7 +671,8 @@ function App() {
 
       setEditingResource(null);
       setResourceForm(emptyResourceForm);
-      fetchMyListings();
+      await fetchMyListings();
+      await fetchResources();
     } catch (err) {
       setFormError(err.message);
     } finally {
@@ -765,9 +771,11 @@ function App() {
       setBookingError("You cannot book your own resource.");
       return;
     }
-    if (selectedResource.eligibility_requirements?.trim() && !eligibilityEvidence.trim()) {
-      setBookingError("Please provide the required eligibility information before submitting.");
-      return;
+    if (selectedResource.eligibility_requirements?.trim()) {
+      if (!eligibilityEvidence.trim() || eligibilityEvidence.trim().length < 10) {
+        setBookingError("Please provide at least 10 characters of eligibility information before submitting.");
+        return;
+      }
     }
 
     setBookingBusy(true);
