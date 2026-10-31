@@ -5,7 +5,7 @@ import {
   LogOut, Sparkles, Package, CalendarCheck, Share2, Search,
   MapPin, X, RefreshCw, ArrowLeft, SlidersHorizontal, Clock,
   Info, CalendarDays, CheckCircle2, XCircle, Plus, Pencil,
-  Trash2, ClipboardList, Bell, CheckCheck, UserRound, Save, GraduationCap, Users, Shield
+  Trash2, ClipboardList, Bell, CheckCheck, UserRound, Save, GraduationCap, Users, Shield, AlertTriangle
 } from "lucide-react";
 
 function ResourceImage({ src, alt = "Campus resource", compact = false }) {
@@ -80,12 +80,18 @@ function App() {
   const [bookingError, setBookingError] = useState("");
   const [bookingMessage, setBookingMessage] = useState("");
 
+  // Subtabs for bookings: "borrower" (My Requests) | "owner" (Incoming Requests) | "waitlist" (Waitlists)
+  const [bookingTab, setBookingTab] = useState("borrower");
+  const [bookingStatusFilter, setBookingStatusFilter] = useState("all");
+  const [profilesMap, setProfilesMap] = useState({});
+
   const [bookingDate, setBookingDate] = useState("");
   const [bookingStart, setBookingStart] = useState("09:00");
   const [bookingEnd, setBookingEnd] = useState("10:00");
   const [bookingNotes, setBookingNotes] = useState("");
   const [lifecycleCondition, setLifecycleCondition] = useState({});
   const [incidentDrafts, setIncidentDrafts] = useState({});
+  const [incidentOpen, setIncidentOpen] = useState({});
   const [waitlistBusy, setWaitlistBusy] = useState(false);
   const [waitlistRequests, setWaitlistRequests] = useState([]);
   const [bookingActivity, setBookingActivity] = useState([]);
@@ -122,6 +128,9 @@ function App() {
   const [adminMessage, setAdminMessage] = useState("");
   const [adminFilter, setAdminFilter] = useState("pending");
   const [adminBusyId, setAdminBusyId] = useState(null);
+  const [adminTab, setAdminTab] = useState("submissions"); // "submissions" | "bookings"
+  const [adminBookingFilter, setAdminBookingFilter] = useState("all");
+  const [adminSearch, setAdminSearch] = useState("");
 
   const unreadCount = notifications.filter((item) => !item.is_read).length;
 
@@ -196,43 +205,6 @@ function App() {
     setProfileSaving(false);
   };
 
-  // ADMIN: LOAD ALL RESOURCES AND USER COUNT
-  const fetchAdminData = async () => {
-    if (profile.role !== "admin") return;
-    setAdminLoading(true);
-    setAdminError("");
-    const [resourceResult, userResult] = await Promise.all([
-      supabase.from("resources").select("*").order("created_at", { ascending: false }),
-      supabase.from("profiles").select("user_id", { count: "exact", head: true })
-    ]);
-    if (resourceResult.error) setAdminError(resourceResult.error.message);
-    else setAdminResources(resourceResult.data || []);
-    if (userResult.error) {
-      setAdminError((current) => current ? `${current} | ${userResult.error.message}` : userResult.error.message);
-    } else setAdminUserCount(userResult.count || 0);
-    setAdminLoading(false);
-  };
-
-  useEffect(() => {
-    if (session && profile.role === "admin" && page === "admin") fetchAdminData();
-  }, [session, profile.role, page]);
-
-  const updateResourceApproval = async (resource, status) => {
-    setAdminBusyId(resource.id);
-    setAdminError("");
-    setAdminMessage("");
-    const { error } = await supabase
-      .from("resources")
-      .update({ approval_status: status })
-      .eq("id", resource.id);
-    if (error) setAdminError(error.message);
-    else {
-      setAdminMessage(`“${resource.title}” was ${status}.`);
-      await fetchAdminData();
-    }
-    setAdminBusyId(null);
-  };
-
   // FETCH CATEGORIES
   const fetchCategories = async () => {
     const { data, error } = await supabase
@@ -287,21 +259,14 @@ function App() {
     setResourceLoading(false);
   };
 
-  useEffect(() => {
-    if (!session) return;
-
-    if (page === "discover") fetchResources();
-    if (page === "mylistings") fetchMyListings();
-  }, [session, page]);
-
-  // FETCH BOOKINGS
+  // FETCH BOOKINGS & RELATED DATA
   const fetchBookings = async () => {
     setBookingLoading(true);
     setBookingError("");
 
     const { data, error } = await supabase
       .from("bookings")
-      .select("*, resources(id, title, location, owner_id)")
+      .select("*, resources(id, title, location, owner_id, usage_rules, eligibility_requirements, max_active_bookings, max_booking_hours)")
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -311,8 +276,14 @@ function App() {
       setBookings(rows);
 
       const bookingIds = rows.map((item) => item.id);
+      const userIds = Array.from(new Set([
+        ...rows.map(b => b.user_id),
+        ...rows.map(b => b.resources?.owner_id).filter(Boolean)
+      ]));
+
+      const promises = [];
       if (bookingIds.length) {
-        const [activityResult, incidentResult, eligibilityResult] = await Promise.all([
+        promises.push(
           supabase.from("booking_activity")
             .select("id, booking_id, actor_id, action, details, created_at")
             .in("booking_id", bookingIds)
@@ -325,25 +296,88 @@ function App() {
             .select("id, booking_id, user_id, evidence_notes, status, reviewed_by, review_notes, created_at, reviewed_at")
             .in("booking_id", bookingIds)
             .order("created_at", { ascending: false })
-        ]);
-        if (!activityResult.error) setBookingActivity(activityResult.data || []);
-        if (!incidentResult.error) setIncidentReports(incidentResult.data || []);
-        if (!eligibilityResult.error) setEligibilityReviews(eligibilityResult.data || []);
+        );
       } else {
-        setBookingActivity([]);
-        setIncidentReports([]);
-        setEligibilityReviews([]);
+        promises.push(
+          Promise.resolve({ data: [] }),
+          Promise.resolve({ data: [] }),
+          Promise.resolve({ data: [] })
+        );
       }
 
-      const { data: waitlistData, error: waitlistError } = await supabase
-        .from("booking_waitlist")
-        .select("id, resource_id, user_id, start_time, end_time, notes, status, created_at, resources(id, title, location, owner_id)")
-        .order("created_at", { ascending: true });
-      if (!waitlistError) setWaitlistRequests(waitlistData || []);
+      if (userIds.length) {
+        promises.push(
+          supabase.from("profiles")
+            .select("user_id, full_name, email, role, department, year_of_study")
+            .in("user_id", userIds)
+        );
+      } else {
+        promises.push(Promise.resolve({ data: [] }));
+      }
+
+      promises.push(
+        supabase.from("booking_waitlist")
+          .select("id, resource_id, user_id, start_time, end_time, notes, status, created_at, resources(id, title, location, owner_id)")
+          .order("created_at", { ascending: true })
+      );
+
+      const [activityResult, incidentResult, eligibilityResult, profilesResult, waitlistResult] = await Promise.all(promises);
+
+      if (!activityResult.error) setBookingActivity(activityResult.data || []);
+      if (!incidentResult.error) setIncidentReports(incidentResult.data || []);
+      if (!eligibilityResult.error) setEligibilityReviews(eligibilityResult.data || []);
+      if (profilesResult && !profilesResult.error) {
+        const pMap = {};
+        (profilesResult.data || []).forEach(p => { pMap[p.user_id] = p; });
+        setProfilesMap(pMap);
+      }
+      if (waitlistResult && !waitlistResult.error) {
+        setWaitlistRequests(waitlistResult.data || []);
+      }
     }
 
     setBookingLoading(false);
   };
+
+  // ADMIN: LOAD ALL RESOURCES AND USER COUNT
+  const fetchAdminData = async () => {
+    if (profile.role !== "admin") return;
+    setAdminLoading(true);
+    setAdminError("");
+    const [resourceResult, userResult] = await Promise.all([
+      supabase.from("resources").select("*").order("created_at", { ascending: false }),
+      supabase.from("profiles").select("user_id", { count: "exact", head: true })
+    ]);
+    if (resourceResult.error) setAdminError(resourceResult.error.message);
+    else setAdminResources(resourceResult.data || []);
+    if (userResult.error) {
+      setAdminError((current) => current ? `${current} | ${userResult.error.message}` : userResult.error.message);
+    } else setAdminUserCount(userResult.count || 0);
+    setAdminLoading(false);
+  };
+
+  const updateResourceApproval = async (resource, status) => {
+    setAdminBusyId(resource.id);
+    setAdminError("");
+    setAdminMessage("");
+    const { error } = await supabase
+      .from("resources")
+      .update({ approval_status: status })
+      .eq("id", resource.id);
+    if (error) setAdminError(error.message);
+    else {
+      setAdminMessage(`“${resource.title}” was ${status}.`);
+      await fetchAdminData();
+    }
+    setAdminBusyId(null);
+  };
+
+  useEffect(() => {
+    if (session && profile.role === "admin" && page === "admin") {
+      fetchAdminData();
+      fetchBookings();
+    }
+  }, [session, profile.role, page]);
 
   useEffect(() => {
     if (session && page === "bookings") fetchBookings();
@@ -727,8 +761,12 @@ function App() {
     }
 
     if (!selectedResource) return;
+    if (selectedResource.owner_id === session.user.id) {
+      setBookingError("You cannot book your own resource.");
+      return;
+    }
     if (selectedResource.eligibility_requirements?.trim() && !eligibilityEvidence.trim()) {
-      setBookingError("Please provide the required eligibility information.");
+      setBookingError("Please provide the required eligibility information before submitting.");
       return;
     }
 
@@ -755,7 +793,6 @@ function App() {
       if (error) throw error;
 
       if (selectedResource.eligibility_requirements?.trim()) {
-        if (!eligibilityEvidence.trim()) throw new Error("Please provide eligibility information for this resource.");
         const { error: eligibilityError } = await supabase.rpc("submit_booking_eligibility", {
           p_booking_id: createdBooking.id,
           p_evidence_notes: eligibilityEvidence.trim()
@@ -763,22 +800,38 @@ function App() {
         if (eligibilityError) throw eligibilityError;
       }
 
-      setBookingMessage("Booking request sent successfully!");
+      setBookingMessage("Booking request sent successfully! You can track it in My Requests.");
       setBookingDate("");
       setBookingStart("09:00");
       setBookingEnd("10:00");
       setBookingNotes("");
       setEligibilityEvidence("");
+      setSelectedResource(null);
       await fetchBookings();
       await fetchNotifications();
     } catch (err) {
-      setBookingError(err.message);
+      setBookingError(err.message || "Failed to submit booking request.");
     } finally {
       setBookingBusy(false);
     }
   };
 
   const updateBookingStatus = async (booking, nextStatus) => {
+    // Front-end security check: Prevent borrowers from approving or rejecting their own booking
+    if (booking.user_id === session.user.id && (nextStatus === "approved" || nextStatus === "rejected")) {
+      setBookingError("Borrowers cannot approve or reject their own booking request.");
+      return;
+    }
+
+    // Eligibility guard before approval
+    if (nextStatus === "approved" && booking.resources?.eligibility_requirements?.trim()) {
+      const review = eligibilityReviews.find(r => r.booking_id === booking.id);
+      if (!review || review.status !== "verified") {
+        setBookingError("Borrower eligibility must be verified before this booking can be approved.");
+        return;
+      }
+    }
+
     setBookingError("");
     setBookingMessage("");
     setBookingBusy(true);
@@ -790,7 +843,7 @@ function App() {
       });
       if (error) throw error;
 
-      setBookingMessage(`Booking ${nextStatus}.`);
+      setBookingMessage(`Booking has been ${nextStatus}.`);
       await fetchBookings();
       await fetchNotifications();
     } catch (err) {
@@ -802,16 +855,34 @@ function App() {
 
   // RESOURCE LIFECYCLE, WAITLIST AND INCIDENT ACTIONS
   const joinWaitlist = async (resource) => {
-    setWaitlistBusy(true); setBookingError(""); setBookingMessage("");
-    const { error } = await supabase.rpc("join_resource_waitlist", {
-      p_resource_id: resource.id,
-      p_start_time: new Date(`${bookingDate}T${bookingStart}:00`).toISOString(),
-      p_end_time: new Date(`${bookingDate}T${bookingEnd}:00`).toISOString(),
-      p_notes: bookingNotes.trim() || null
-    });
-    if (error) setBookingError(error.message);
-    else setBookingMessage("You have joined the waitlist for this time slot.");
-    setWaitlistBusy(false);
+    if (!bookingDate || !bookingStart || !bookingEnd) {
+      setBookingError("Please select a date, start time and end time to join the waitlist.");
+      return;
+    }
+    if (resource.owner_id === session.user.id) {
+      setBookingError("You cannot join the waitlist for your own resource.");
+      return;
+    }
+    setWaitlistBusy(true);
+    setBookingError("");
+    setBookingMessage("");
+    try {
+      const { error } = await supabase.rpc("join_resource_waitlist", {
+        p_resource_id: resource.id,
+        p_start_time: new Date(`${bookingDate}T${bookingStart}:00`).toISOString(),
+        p_end_time: new Date(`${bookingDate}T${bookingEnd}:00`).toISOString(),
+        p_notes: bookingNotes.trim() || null
+      });
+      if (error) throw error;
+      setBookingMessage("You have joined the transparent waitlist for this time slot. You will be notified when a slot opens.");
+      setSelectedResource(null);
+      await fetchBookings();
+      await fetchNotifications();
+    } catch (err) {
+      setBookingError(err.message || "Could not join waitlist.");
+    } finally {
+      setWaitlistBusy(false);
+    }
   };
 
   const manageWaitlist = async (request, action) => {
@@ -823,10 +894,15 @@ function App() {
         : action === "accept" ? "accept_waitlist_offer"
         : "cancel_waitlist_request";
       const { error } = await supabase.rpc(rpcName, { p_waitlist_id: request.id });
-      if (error) throw error;
+      if (error) {
+        if (error.message?.includes("function") && error.message?.includes("does not exist")) {
+          throw new Error(`The waitlist database function "${rpcName}" has not yet been applied via SQL migration.`);
+        }
+        throw error;
+      }
       setBookingMessage(
-        action === "offer" ? "A waitlist offer has been sent."
-        : action === "accept" ? "Waitlist offer accepted. A booking request has been created."
+        action === "offer" ? "A waitlist slot offer has been sent to the next borrower in queue."
+        : action === "accept" ? "Waitlist offer accepted! A pending booking request has been created."
         : "Waitlist request cancelled."
       );
       await fetchBookings();
@@ -839,59 +915,123 @@ function App() {
   };
 
   const reviewEligibility = async (reviewId, decision) => {
-    const notes = window.prompt(decision === "verified" ? "Add verification notes (optional):" : "Explain why eligibility was not verified:");
-    if (decision === "rejected" && !notes?.trim()) return;
+    const promptLabel = decision === "verified"
+      ? "Add verification notes (optional):"
+      : "Explain why eligibility was rejected (required):";
+    const notes = window.prompt(promptLabel, decision === "verified" ? "Verified institutional eligibility" : "");
+    if (decision === "rejected" && (!notes || !notes.trim())) {
+      setBookingError("A reason is required when rejecting eligibility.");
+      return;
+    }
     setBookingBusy(true);
-    const { error } = await supabase.rpc("review_booking_eligibility", {
-      p_review_id: reviewId,
-      p_status: decision,
-      p_review_notes: notes?.trim() || null
-    });
-    if (error) setBookingError(error.message);
-    else {
-      setBookingMessage(decision === "verified" ? "Eligibility verified." : "Eligibility not verified.");
+    setBookingError("");
+    setBookingMessage("");
+    try {
+      const { error } = await supabase.rpc("review_booking_eligibility", {
+        p_review_id: reviewId,
+        p_status: decision,
+        p_review_notes: notes?.trim() || null
+      });
+      if (error) throw error;
+      setBookingMessage(decision === "verified" ? "Eligibility successfully verified!" : "Eligibility decision recorded as rejected.");
       await fetchBookings();
       await fetchNotifications();
+    } catch (err) {
+      setBookingError(err.message || "Could not record eligibility decision.");
+    } finally {
+      setBookingBusy(false);
     }
-    setBookingBusy(false);
   };
 
   const runBookingLifecycle = async (booking, action) => {
     const draft = lifecycleCondition[booking.id] || {};
     const condition = action === "check_in" ? draft.initial : draft.returning;
-    if (!condition?.trim()) { setBookingError("Please describe the resource condition before continuing."); return; }
-    setBookingBusy(true); setBookingError(""); setBookingMessage("");
-    const { error } = await supabase.rpc(action === "check_in" ? "check_in_booking" : "check_out_booking", {
-      p_booking_id: booking.id,
-      [action === "check_in" ? "p_initial_condition" : "p_return_condition"]: condition.trim(),
-      p_notes: draft.notes?.trim() || null
-    });
-    if (error) setBookingError(error.message);
-    else { setBookingMessage(action === "check_in" ? "Check-in recorded." : "Return condition recorded."); await fetchBookings(); }
-    setBookingBusy(false);
+    if (!condition?.trim()) {
+      setBookingError(action === "check_in"
+        ? "Please describe the resource condition before completing check-in."
+        : "Please describe the resource condition before completing return & checkout.");
+      return;
+    }
+    setBookingBusy(true);
+    setBookingError("");
+    setBookingMessage("");
+    try {
+      const { error } = await supabase.rpc(action === "check_in" ? "check_in_booking" : "check_out_booking", {
+        p_booking_id: booking.id,
+        [action === "check_in" ? "p_initial_condition" : "p_return_condition"]: condition.trim(),
+        p_notes: draft.notes?.trim() || null
+      });
+      if (error) throw error;
+      setBookingMessage(action === "check_in"
+        ? "Check-in recorded! Initial condition has been logged."
+        : "Return condition recorded! Booking is now completed.");
+      setLifecycleCondition(prev => ({ ...prev, [booking.id]: { initial: "", returning: "", notes: "" } }));
+      await fetchBookings();
+      await fetchNotifications();
+    } catch (err) {
+      setBookingError(err.message || "Could not record condition report.");
+    } finally {
+      setBookingBusy(false);
+    }
   };
 
   const reportIncident = async (booking) => {
     const draft = incidentDrafts[booking.id] || {};
-    if (!draft.description?.trim()) { setBookingError("Describe the issue before submitting the report."); return; }
-    setBookingBusy(true); setBookingError(""); setBookingMessage("");
-    const { error } = await supabase.from("incident_reports").insert({
-      booking_id: booking.id, reported_by: session.user.id,
-      incident_type: draft.type || "other", description: draft.description.trim(), status: "open"
-    });
-    if (error) setBookingError(error.message);
-    else { setBookingMessage("Incident report submitted for review."); setIncidentDrafts(prev => ({ ...prev, [booking.id]: { type: "other", description: "" } })); }
-    setBookingBusy(false);
+    if (!draft.description?.trim()) {
+      setBookingError("Please describe the incident, damage, or issue before submitting.");
+      return;
+    }
+    setBookingBusy(true);
+    setBookingError("");
+    setBookingMessage("");
+    try {
+      const { error } = await supabase.from("incident_reports").insert({
+        booking_id: booking.id,
+        reported_by: session.user.id,
+        incident_type: draft.type || "damage",
+        description: draft.description.trim(),
+        status: "open"
+      });
+      if (error) throw error;
+      setBookingMessage("Incident report submitted successfully for owner and administrator review.");
+      setIncidentDrafts(prev => ({ ...prev, [booking.id]: { type: "damage", description: "" } }));
+      setIncidentOpen(prev => ({ ...prev, [booking.id]: false }));
+      await fetchBookings();
+      await fetchNotifications();
+    } catch (err) {
+      setBookingError(err.message || "Failed to submit incident report.");
+    } finally {
+      setBookingBusy(false);
+    }
   };
 
   const resolveIncident = async (incidentId, status = "resolved") => {
-    const notes = window.prompt("Add resolution notes (required):");
-    if (!notes?.trim()) return;
-    const { error } = await supabase.rpc("resolve_incident", {
-      p_incident_id: incidentId, p_resolution_notes: notes.trim(), p_status: status
-    });
-    if (error) setBookingError(error.message);
-    else { setBookingMessage(`Incident ${status}.`); fetchBookings(); }
+    const promptText = status === "resolved"
+      ? "Enter resolution notes (required):"
+      : "Enter reason for rejecting this incident report (required):";
+    const notes = window.prompt(promptText, status === "resolved" ? "Issue resolved and documented." : "");
+    if (!notes?.trim()) {
+      setBookingError("Resolution notes are required.");
+      return;
+    }
+    setBookingBusy(true);
+    setBookingError("");
+    setBookingMessage("");
+    try {
+      const { error } = await supabase.rpc("resolve_incident", {
+        p_incident_id: incidentId,
+        p_resolution_notes: notes.trim(),
+        p_status: status
+      });
+      if (error) throw error;
+      setBookingMessage(`Incident report marked as ${status}.`);
+      await fetchBookings();
+      await fetchNotifications();
+    } catch (err) {
+      setBookingError(err.message || "Could not update incident report.");
+    } finally {
+      setBookingBusy(false);
+    }
   };
 
   // SEARCH, FILTER, CATEGORY AND SORT
@@ -921,6 +1061,33 @@ function App() {
 
   const isAvailable = (status) =>
     (status || "").toLowerCase() === "available";
+
+  // SEPARATED BOOKINGS COLLECTIONS
+  const currentUserId = session?.user?.id;
+
+  const borrowerBookings = useMemo(() => {
+    if (!currentUserId) return [];
+    return bookings.filter(b => b.user_id === currentUserId);
+  }, [bookings, currentUserId]);
+
+  const ownerBookings = useMemo(() => {
+    if (!currentUserId) return [];
+    return bookings.filter(b => b.resources?.owner_id === currentUserId);
+  }, [bookings, currentUserId]);
+
+  const pendingOwnerCount = useMemo(() => {
+    return ownerBookings.filter(b => b.status === "pending").length;
+  }, [ownerBookings]);
+
+  const myWaitlist = useMemo(() => {
+    if (!currentUserId) return [];
+    return waitlistRequests.filter(w => w.user_id === currentUserId);
+  }, [waitlistRequests, currentUserId]);
+
+  const ownerWaitlist = useMemo(() => {
+    if (!currentUserId) return [];
+    return waitlistRequests.filter(w => w.resources?.owner_id === currentUserId && w.user_id !== currentUserId);
+  }, [waitlistRequests, currentUserId]);
 
   // LOADING
   if (loading) {
@@ -975,7 +1142,7 @@ function App() {
               </div>
 
               <div className="hero-bottom">
-                BUILT FOR STUDENTS. POWERED BY COMMUNITY.
+                BUILT FOR STUDENTS & INSTITUTIONS · TRUSTED RESOURCE ALLOCATION
               </div>
             </section>
 
@@ -1199,21 +1366,21 @@ function App() {
             <h1>Welcome to <span className="teal">AccessLoop.</span></h1>
 
             <p className="dashboard-subtitle">
-              Discover resources. Make connections. Share more.
+              Discover resources. Make connections. Share equipment safely.
             </p>
 
             <div className="dashboard-grid">
               <button className="dashboard-card" onClick={() => setPage("discover")}>
                 <Package size={31} />
                 <h3>Discover</h3>
-                <p>Explore equipment and spaces available on campus.</p>
+                <p>Explore equipment, spaces, and devices available on campus.</p>
                 <span className="card-link">Explore resources <ArrowRight size={16} /></span>
               </button>
 
               <button className="dashboard-card" onClick={openShare}>
                 <Share2 size={31} />
                 <h3>Share</h3>
-                <p>List your unused equipment and make it useful to others.</p>
+                <p>List your unused equipment with custom usage rules and eligibility checks.</p>
                 <span className="card-link">Share a resource <ArrowRight size={16} /></span>
               </button>
 
@@ -1226,15 +1393,19 @@ function App() {
 
               <button className="dashboard-card" onClick={() => setPage("bookings")}>
                 <CalendarCheck size={31} />
-                <h3>My Bookings</h3>
-                <p>Track requests and manage reservations for your resources.</p>
-                <span className="card-link">View bookings <ArrowRight size={16} /></span>
+                <h3>Bookings & Requests</h3>
+                <p>Track your requests and manage incoming requests for your resources.</p>
+                <span className="card-link">
+                  Manage reservations
+                  {pendingOwnerCount > 0 && <span className="tab-alert-badge" style={{ marginLeft: 6 }}>{pendingOwnerCount} new</span>}
+                  <ArrowRight size={16} />
+                </span>
               </button>
- 
+
               <button className="dashboard-card" onClick={() => setPage("profile")}>
                 <UserRound size={31} />
                 <h3>My Profile</h3>
-                <p>Manage your campus identity and personal details.</p>
+                <p>Manage your campus identity, department, and credentials.</p>
                 <span className="card-link">View profile <ArrowRight size={16} /></span>
               </button>
 
@@ -1242,7 +1413,7 @@ function App() {
                 <button className="dashboard-card admin-dashboard-card" onClick={() => setPage("admin")}>
                   <Shield size={31} />
                   <h3>Admin Dashboard</h3>
-                  <p>Review submissions, manage resources and monitor AccessLoop.</p>
+                  <p>Review submissions, oversee all bookings, and monitor network safety.</p>
                   <span className="card-link">Open admin centre <ArrowRight size={16} /></span>
                 </button>
               )}
@@ -1250,7 +1421,7 @@ function App() {
 
             <div className="coming-soon">
               <Sparkles size={19} />
-              Your campus resources, connected in one place.
+              Fair access, verifiable eligibility, condition reporting, and trusted campus sharing.
             </div>
           </main>
         )}
@@ -1269,13 +1440,13 @@ function App() {
                 </div>
                 <h1>Discover <span className="teal">Resources.</span></h1>
                 <p className="dashboard-subtitle">
-                  Find equipment and spaces your campus has to offer.
+                  Find equipment, labs, and spaces ready for booking.
                 </p>
               </div>
 
               <div className="resource-count">
                 <Package size={21} />
-                {resources.length} resources
+                {resources.length} resources available
               </div>
             </div>
 
@@ -1283,7 +1454,7 @@ function App() {
               <div className="search-box">
                 <Search size={20} />
                 <input
-                  placeholder="Search equipment, spaces or locations..."
+                  placeholder="Search equipment, spaces, departments or locations..."
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                 />
@@ -1343,7 +1514,7 @@ function App() {
 
             {!resourceLoading && !resourceError && filteredResources.length === 0 && (
               <div className="empty-panel">
-                No matching resources found.
+                No matching resources found. Try adjusting your filters.
               </div>
             )}
 
@@ -1370,7 +1541,9 @@ function App() {
                     <div className="resource-location">
                       <MapPin size={15} /> {resource.location}
                     </div>
-                    <p className="booking-hint">Up to {resource.max_booking_hours || 4}h · {resource.eligibility_requirements ? "Eligibility applies" : "Open eligibility"}</p>
+                    <p className="booking-hint">
+                      Limit: up to {resource.max_booking_hours || 4}h · {resource.eligibility_requirements ? "Eligibility required" : "Open access"}
+                    </p>
 
                     <button
                       className="details-button"
@@ -1380,7 +1553,7 @@ function App() {
                         setBookingMessage("");
                       }}
                     >
-                      View details <ArrowRight size={16} />
+                      View details & reserve <ArrowRight size={16} />
                     </button>
                   </div>
                 </article>
@@ -1403,7 +1576,7 @@ function App() {
             <h1>Share a <span className="teal">Resource.</span></h1>
 
             <p className="dashboard-subtitle">
-              Help other students access equipment and spaces you can share.
+              List equipment or spaces with clear usage guidelines, eligibility checks, and fair allocation rules.
             </p>
 
             <form className="resource-form" onSubmit={submitResource}>
@@ -1414,7 +1587,7 @@ function App() {
                 name="title"
                 value={resourceForm.title}
                 onChange={handleResourceFormChange}
-                placeholder="e.g. Arduino Uno Starter Kit"
+                placeholder="e.g. 3D Printer (Ultimaker S5), DSLR Camera Kit, Physics Lab Room 302"
                 required
               />
 
@@ -1424,7 +1597,7 @@ function App() {
                 rows="4"
                 value={resourceForm.description}
                 onChange={handleResourceFormChange}
-                placeholder="Describe the resource and how students can use it..."
+                placeholder="Describe the resource, included accessories, specifications, and suggested uses..."
               />
 
               <label>Category</label>
@@ -1446,7 +1619,7 @@ function App() {
                 name="location"
                 value={resourceForm.location}
                 onChange={handleResourceFormChange}
-                placeholder="e.g. CSE Department, Lab 2"
+                placeholder="e.g. Engineering Block B, Room 204"
                 required
               />
 
@@ -1459,7 +1632,7 @@ function App() {
                 placeholder="https://example.com/image.jpg"
               />
 
-              <label>Availability</label>
+              <label>Availability status</label>
               <select
                 name="availability_status"
                 value={resourceForm.availability_status}
@@ -1469,25 +1642,59 @@ function App() {
                 <option value="unavailable">Unavailable</option>
               </select>
 
-              <label>Usage rules</label>
-              <textarea name="usage_rules" rows="2" value={resourceForm.usage_rules} onChange={handleResourceFormChange} placeholder="Care instructions, supervision, return expectations..." />
-              <label>Eligibility requirements</label>
-              <textarea name="eligibility_requirements" rows="2" value={resourceForm.eligibility_requirements} onChange={handleResourceFormChange} placeholder="e.g. GCET students, faculty approval required..." />
+              <label>Usage rules & care instructions</label>
+              <textarea
+                name="usage_rules"
+                rows="2"
+                value={resourceForm.usage_rules}
+                onChange={handleResourceFormChange}
+                placeholder="e.g. Must be returned clean, supervision required, no food/liquids nearby..."
+              />
+
+              <label>Eligibility requirements (optional qualification / training check)</label>
+              <textarea
+                name="eligibility_requirements"
+                rows="2"
+                value={resourceForm.eligibility_requirements}
+                onChange={handleResourceFormChange}
+                placeholder="e.g. Completed Lab Safety 101, valid CSE department ID, or faculty endorsement..."
+              />
+
               <div className="time-fields">
-                <div><label>Max active bookings per user</label><input type="number" min="1" max="20" name="max_active_bookings" value={resourceForm.max_active_bookings} onChange={handleResourceFormChange} /></div>
-                <div><label>Maximum booking hours</label><input type="number" min="1" max="24" name="max_booking_hours" value={resourceForm.max_booking_hours} onChange={handleResourceFormChange} /></div>
+                <div>
+                  <label>Max active bookings per borrower</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="20"
+                    name="max_active_bookings"
+                    value={resourceForm.max_active_bookings}
+                    onChange={handleResourceFormChange}
+                  />
+                </div>
+                <div>
+                  <label>Maximum booking hours per request</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="24"
+                    name="max_booking_hours"
+                    value={resourceForm.max_booking_hours}
+                    onChange={handleResourceFormChange}
+                  />
+                </div>
               </div>
 
               <div className="approval-note">
                 <ShieldCheck size={18} />
-                Your listing will be reviewed by an admin before appearing in Discover.
+                Your listing will be reviewed by a campus administrator before appearing publicly in Discover.
               </div>
 
               {formError && <div className="error-box">{formError}</div>}
               {formMessage && <div className="success-box">{formMessage}</div>}
 
               <button className="submit-button" disabled={formBusy}>
-                {formBusy ? "Submitting..." : "Submit resource for approval"}
+                {formBusy ? "Submitting..." : "Submit resource for review"}
                 <ArrowRight size={17} />
               </button>
             </form>
@@ -1508,7 +1715,7 @@ function App() {
                 </div>
                 <h1>My <span className="teal">Listings.</span></h1>
                 <p className="dashboard-subtitle">
-                  Manage resources you have shared with your campus.
+                  Manage resources you have shared with the campus community.
                 </p>
               </div>
 
@@ -1564,7 +1771,7 @@ function App() {
                     </div>
 
                     <p className="listing-availability">
-                      Availability: {resource.availability_status}
+                      Availability: <strong>{resource.availability_status}</strong> · Limit: {resource.max_booking_hours || 4}h
                     </p>
 
                     <div className="listing-actions">
@@ -1596,7 +1803,7 @@ function App() {
           </main>
         )}
 
-        {/* BOOKINGS */}
+        {/* BOOKINGS AND RESERVATION CENTRE */}
         {page === "bookings" && (
           <main className="marketplace">
             <button className="back-button" onClick={() => setPage("home")}>
@@ -1608,9 +1815,9 @@ function App() {
                 <div className="welcome-tag">
                   <CalendarDays size={15} /> RESERVATION CENTRE
                 </div>
-                <h1>My <span className="teal">Bookings.</span></h1>
+                <h1>Bookings & <span className="teal">Requests.</span></h1>
                 <p className="dashboard-subtitle">
-                  Track your requests and manage requests for your resources.
+                  Distinct workflows for your booking requests, incoming resource requests, and waitlists.
                 </p>
               </div>
 
@@ -1622,240 +1829,694 @@ function App() {
             {bookingError && <div className="error-box">{bookingError}</div>}
             {bookingMessage && <div className="success-box">{bookingMessage}</div>}
 
+            {/* SEPARATE WORKFLOW TABS */}
+            <div className="booking-subtabs">
+              <button
+                type="button"
+                className={`booking-tab-btn ${bookingTab === "borrower" ? "active" : ""}`}
+                onClick={() => { setBookingTab("borrower"); setBookingStatusFilter("all"); }}
+              >
+                <UserRound size={17} />
+                <span>My Requests</span>
+                <span className="tab-pill">{borrowerBookings.length}</span>
+              </button>
+
+              <button
+                type="button"
+                className={`booking-tab-btn ${bookingTab === "owner" ? "active" : ""}`}
+                onClick={() => { setBookingTab("owner"); setBookingStatusFilter("all"); }}
+              >
+                <ClipboardList size={17} />
+                <span>Incoming Requests</span>
+                <span className="tab-pill">{ownerBookings.length}</span>
+                {pendingOwnerCount > 0 && (
+                  <span className="tab-alert-badge">{pendingOwnerCount} action required</span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                className={`booking-tab-btn ${bookingTab === "waitlist" ? "active" : ""}`}
+                onClick={() => setBookingTab("waitlist")}
+              >
+                <Clock size={17} />
+                <span>Waitlists</span>
+                <span className="tab-pill">{myWaitlist.length + ownerWaitlist.length}</span>
+              </button>
+            </div>
+
             {bookingLoading ? (
-              <div className="state-message">Loading bookings...</div>
+              <div className="state-message">Loading booking records...</div>
             ) : (
               <>
-                <div className="results-heading">
-                  <h2>Requests I made</h2>
-                  <span>
-                    {bookings.filter(b => b.user_id === session.user.id).length} requests
-                  </span>
-                </div>
+                {/* 1. MY REQUESTS (BORROWER WORKFLOW) */}
+                {bookingTab === "borrower" && (
+                  <section>
+                    <div className="results-heading">
+                      <div>
+                        <h2>Requests I Made</h2>
+                        <p className="section-subtext">Bookings you have requested across campus resources.</p>
+                      </div>
+                      <span>{borrowerBookings.length} total</span>
+                    </div>
 
-                {bookings.filter(b => b.user_id === session.user.id).length === 0 ? (
-                  <div className="empty-panel">
-                    You haven't requested any resources yet.
-                  </div>
-                ) : (
-                  bookings
-                    .filter(b => b.user_id === session.user.id)
-                    .map(booking => (
-                      <article className="booking-card" key={booking.id}>
-                        <div>
-                          <h3>{booking.resources?.title || "Campus resource"}</h3>
-                          <p>{booking.resources?.location || "Location unavailable"}</p>
-                          <span>
-                            {new Date(booking.start_time).toLocaleString()} –{" "}
-                            {new Date(booking.end_time).toLocaleTimeString([], {
-                              hour: "2-digit",
-                              minute: "2-digit"
-                            })}
-                          </span>
-                          {booking.notes && (
-                            <p className="booking-notes">“{booking.notes}”</p>
-                          )}
-                          {booking.status === "approved" && (
-                            <div className="resource-form compact-form" style={{ marginTop: 14 }}>
-                              {!booking.check_in_at ? (
-                                <>
-                                  <label>Condition before use</label>
-                                  <textarea rows="2" value={lifecycleCondition[booking.id]?.initial || ""} onChange={e => setLifecycleCondition(prev => ({ ...prev, [booking.id]: { ...prev[booking.id], initial: e.target.value } }))} placeholder="Describe existing condition, visible damage or missing parts..." />
-                                  <button type="button" className="approve-button" disabled={bookingBusy} onClick={() => runBookingLifecycle(booking, "check_in")}>Record check-in</button>
-                                </>
-                              ) : !booking.check_out_at ? (
-                                <>
-                                  <p className="booking-hint">Checked in: {new Date(booking.check_in_at).toLocaleString()}</p>
-                                  <label>Condition on return</label>
-                                  <textarea rows="2" value={lifecycleCondition[booking.id]?.returning || ""} onChange={e => setLifecycleCondition(prev => ({ ...prev, [booking.id]: { ...prev[booking.id], returning: e.target.value } }))} placeholder="Describe the condition when returning..." />
-                                  <button type="button" className="approve-button" disabled={bookingBusy} onClick={() => runBookingLifecycle(booking, "check_out")}>Record return</button>
-                                </>
-                              ) : <p className="booking-hint">Returned: {new Date(booking.check_out_at).toLocaleString()}</p>}
-                              <label>Report a delay, damage or issue</label>
-                              <select value={incidentDrafts[booking.id]?.type || "other"} onChange={e => setIncidentDrafts(prev => ({ ...prev, [booking.id]: { ...prev[booking.id], type: e.target.value } }))}>
-                                <option value="other">Other issue</option><option value="damage">Damage</option><option value="delay">Late return</option><option value="conflict">Conflict</option><option value="safety">Safety concern</option>
-                              </select>
-                              <textarea rows="2" value={incidentDrafts[booking.id]?.description || ""} onChange={e => setIncidentDrafts(prev => ({ ...prev, [booking.id]: { ...prev[booking.id], description: e.target.value } }))} placeholder="Explain the issue..." />
-                              <button type="button" className="refresh-button" disabled={bookingBusy} onClick={() => reportIncident(booking)}>Submit incident report</button>
-                            </div>
-                          )}
-                        </div>
+                    <div className="filter-row" style={{ marginTop: 10, marginBottom: 20 }}>
+                      <span className="filter-label">Filter:</span>
+                      {["all", "pending", "approved", "completed", "cancelled", "rejected"].map((st) => (
+                        <button
+                          key={st}
+                          type="button"
+                          className={`filter-chip ${bookingStatusFilter === st ? "selected" : ""}`}
+                          onClick={() => setBookingStatusFilter(st)}
+                        >
+                          {st === "all" ? "All requests" : st === "approved" ? "Approved / Active" : st[0].toUpperCase() + st.slice(1)}
+                        </button>
+                      ))}
+                    </div>
 
-                        <span className={`booking-status ${booking.status}`}>
-                          {booking.status}
-                        </span>
-                        {eligibilityReviews.filter(item => item.booking_id === booking.id).map(review => (
-                          <div key={review.id} style={{ width: "100%", marginTop: 10 }}>
-                            <strong>Eligibility: {review.status}</strong>
-                            {review.review_notes && <p className="booking-hint">Review notes: {review.review_notes}</p>}
-                          </div>
-                        ))}
-                        <div style={{ width: "100%", marginTop: 10 }}>
-                          <strong>Transaction history</strong>
-                          {bookingActivity.filter(item => item.booking_id === booking.id).map(item => (
-                            <p className="booking-hint" key={item.id}>
-                              {new Date(item.created_at).toLocaleString()} · {item.action.replaceAll("_", " ")}
-                              {item.details ? ` — ${item.details}` : ""}
-                            </p>
-                          ))}
-                          {eligibilityReviews.filter(item => item.booking_id === booking.id).map(review => (
-                            <div key={review.id} style={{ marginTop: 12, padding: 12, border: "1px solid var(--border, #dbe4e8)", borderRadius: 12 }}>
-                              <strong>Eligibility review · {review.status}</strong>
-                              <p>{review.evidence_notes}</p>
-                              {review.review_notes && <p className="booking-hint">Review notes: {review.review_notes}</p>}
-                              {review.status === "pending" && (booking.resources?.owner_id === session.user.id || profile.role === "admin") && (
-                                <div className="booking-actions">
-                                  <button type="button" className="approve-button" disabled={bookingBusy} onClick={() => reviewEligibility(review.id, "verified")}>Verify eligibility</button>
-                                  <button type="button" className="reject-button" disabled={bookingBusy} onClick={() => reviewEligibility(review.id, "rejected")}>Reject eligibility</button>
+                    {borrowerBookings.filter(b => bookingStatusFilter === "all" || b.status === bookingStatusFilter).length === 0 ? (
+                      <div className="empty-panel">
+                        No {bookingStatusFilter === "all" ? "" : bookingStatusFilter} requests found.
+                        <button className="inline-link" onClick={() => setPage("discover")}>
+                          Explore campus marketplace
+                        </button>
+                      </div>
+                    ) : (
+                      borrowerBookings
+                        .filter(b => bookingStatusFilter === "all" || b.status === bookingStatusFilter)
+                        .map((booking) => {
+                          const review = eligibilityReviews.find(r => r.booking_id === booking.id);
+                          const incidents = incidentReports.filter(i => i.booking_id === booking.id);
+                          const activities = bookingActivity.filter(a => a.booking_id === booking.id);
+                          const isCompleted = booking.status === "completed" || Boolean(booking.check_out_at);
+
+                          return (
+                            <article className="booking-card" key={booking.id}>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                                  <div>
+                                    <h3>{booking.resources?.title || "Campus resource"}</h3>
+                                    <p><MapPin size={13} style={{ display: "inline", verticalAlign: "middle", marginRight: 4 }} /> {booking.resources?.location || "Location not specified"}</p>
+                                  </div>
+                                  <span className={`booking-status ${isCompleted ? "completed" : booking.status}`}>
+                                    {isCompleted ? "Completed" : booking.status}
+                                  </span>
                                 </div>
-                              )}
-                            </div>
-                          ))}
-                          {incidentReports.filter(item => item.booking_id === booking.id).map(incident => (
-                            <p className="booking-hint" key={incident.id}>
-                              Incident: {incident.incident_type} · {incident.status}
-                              {incident.resolution_notes ? ` — ${incident.resolution_notes}` : ""}
-                            </p>
-                          ))}
-                        </div>
-                        {booking.status === "pending" && (
-                          <button type="button" className="reject-button" onClick={() => updateBookingStatus(booking, "cancelled")}>Cancel request</button>
-                        )}
-                      </article>
-                    ))
+
+                                <p className="booking-time-display">
+                                  <CalendarDays size={14} style={{ display: "inline", verticalAlign: "middle", marginRight: 4 }} />
+                                  {new Date(booking.start_time).toLocaleString()} –{" "}
+                                  {new Date(booking.end_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                </p>
+
+                                {booking.notes && (
+                                  <p className="booking-notes">Message to owner: “{booking.notes}”</p>
+                                )}
+
+                                {/* BORROWER ELIGIBILITY STATUS (READ-ONLY) */}
+                                {booking.resources?.eligibility_requirements && (
+                                  <div className="evidence-panel">
+                                    <div className="evidence-panel-header">
+                                      <strong>Eligibility verification</strong>
+                                      <span className={`status-badge ${review?.status === "verified" ? "available" : review?.status === "rejected" ? "unavailable" : "pending"}`}>
+                                        {review?.status === "verified" ? "✓ Verified by Owner" : review?.status === "rejected" ? "✕ Not Verified" : "⏳ Pending Owner Review"}
+                                      </span>
+                                    </div>
+                                    <p className="booking-hint">Requirements: {booking.resources.eligibility_requirements}</p>
+                                    {review?.evidence_notes && (
+                                      <p className="evidence-text">Your submitted evidence: “{review.evidence_notes}”</p>
+                                    )}
+                                    {review?.review_notes && (
+                                      <p className="booking-hint" style={{ color: review.status === "rejected" ? "#ffb4bf" : "#7cf3d9" }}>
+                                        Owner review note: “{review.review_notes}”
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
+
+                                {/* CHECK-IN & CHECK-OUT LIFECYCLE */}
+                                {booking.status === "approved" && (
+                                  <div className="condition-card">
+                                    <h4><ClipboardList size={16} /> Usage & Condition Documentation</h4>
+                                    {!booking.check_in_at ? (
+                                      <div style={{ marginTop: 10 }}>
+                                        <label>Document condition before use (Check-in) *</label>
+                                        <textarea
+                                          rows="2"
+                                          value={lifecycleCondition[booking.id]?.initial || ""}
+                                          onChange={(e) => setLifecycleCondition(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], initial: e.target.value }
+                                          }))}
+                                          placeholder="Inspect the resource: note any pre-existing scratches, cleanliness, or missing accessories..."
+                                        />
+                                        <button
+                                          type="button"
+                                          className="approve-button"
+                                          style={{ marginTop: 8 }}
+                                          disabled={bookingBusy}
+                                          onClick={() => runBookingLifecycle(booking, "check_in")}
+                                        >
+                                          <CheckCircle2 size={15} /> Record Check-in & Condition
+                                        </button>
+                                      </div>
+                                    ) : !booking.check_out_at ? (
+                                      <div style={{ marginTop: 10 }}>
+                                        <p className="booking-hint" style={{ color: "#7cf3d9" }}>
+                                          ✓ Checked in at {new Date(booking.check_in_at).toLocaleString()}
+                                        </p>
+                                        <p className="booking-hint">Initial condition: “{booking.initial_condition}”</p>
+
+                                        <label style={{ marginTop: 14 }}>Document condition on return (Check-out) *</label>
+                                        <textarea
+                                          rows="2"
+                                          value={lifecycleCondition[booking.id]?.returning || ""}
+                                          onChange={(e) => setLifecycleCondition(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], returning: e.target.value }
+                                          }))}
+                                          placeholder="Describe returned condition: fully working, cleaned, accessories accounted for..."
+                                        />
+                                        <button
+                                          type="button"
+                                          className="approve-button"
+                                          style={{ marginTop: 8 }}
+                                          disabled={bookingBusy}
+                                          onClick={() => runBookingLifecycle(booking, "check_out")}
+                                        >
+                                          <CheckCircle2 size={15} /> Record Return & Complete Booking
+                                        </button>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                )}
+
+                                {/* RECORDED BEFORE & AFTER CONDITIONS */}
+                                {(booking.check_in_at || booking.check_out_at) && (
+                                  <div className="condition-box" style={{ marginTop: 12 }}>
+                                    <strong>Documented Condition History</strong>
+                                    <div className="condition-row">
+                                      <div>
+                                        <small style={{ color: "#8295ad" }}>Check-in Condition ({booking.check_in_at ? new Date(booking.check_in_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "N/A"}):</small>
+                                        <p>{booking.initial_condition || "Not recorded"}</p>
+                                      </div>
+                                      <div>
+                                        <small style={{ color: "#8295ad" }}>Return Condition ({booking.check_out_at ? new Date(booking.check_out_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "In use"}):</small>
+                                        <p>{booking.return_condition || (booking.check_in_at ? "Resource currently in use" : "Awaiting check-in")}</p>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* INCIDENT REPORTING (AVAILABLE WHILE APPROVED AND AFTER RETURN) */}
+                                {(booking.status === "approved" || isCompleted) && (
+                                  <div style={{ marginTop: 14 }}>
+                                    <button
+                                      type="button"
+                                      className="inline-link"
+                                      style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}
+                                      onClick={() => setIncidentOpen(prev => ({ ...prev, [booking.id]: !prev[booking.id] }))}
+                                    >
+                                      <AlertTriangle size={14} />
+                                      {incidentOpen[booking.id] ? "Hide Incident Form" : "Report a damage, delay, or safety concern"}
+                                    </button>
+
+                                    {incidentOpen[booking.id] && (
+                                      <div className="evidence-panel" style={{ marginTop: 8 }}>
+                                        <strong>Submit Incident Report</strong>
+                                        <label style={{ marginTop: 8 }}>Incident type</label>
+                                        <select
+                                          value={incidentDrafts[booking.id]?.type || "damage"}
+                                          onChange={(e) => setIncidentDrafts(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], type: e.target.value }
+                                          }))}
+                                        >
+                                          <option value="damage">Equipment Damage / Broken Part</option>
+                                          <option value="delay">Return Delay / Overdue Extension Needed</option>
+                                          <option value="conflict">Access / Scheduling Conflict</option>
+                                          <option value="safety">Safety Hazard / Precaution Issue</option>
+                                          <option value="other">Other Incident</option>
+                                        </select>
+                                        <label>Description of the issue *</label>
+                                        <textarea
+                                          rows="2"
+                                          value={incidentDrafts[booking.id]?.description || ""}
+                                          onChange={(e) => setIncidentDrafts(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], description: e.target.value }
+                                          }))}
+                                          placeholder="Explain what happened, any visible damage, and current status..."
+                                        />
+                                        <button
+                                          type="button"
+                                          className="refresh-button"
+                                          style={{ marginTop: 10 }}
+                                          disabled={bookingBusy}
+                                          onClick={() => reportIncident(booking)}
+                                        >
+                                          Submit Incident Report
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+
+                                {/* EXISTING INCIDENTS ON THIS BOOKING */}
+                                {incidents.length > 0 && (
+                                  <div style={{ marginTop: 12 }}>
+                                    <strong style={{ fontSize: 12, color: "#cbd7e5" }}>Reported Incidents:</strong>
+                                    {incidents.map(inc => (
+                                      <div key={inc.id} className="incident-card" style={{ marginTop: 6, padding: 10, background: "#0f1f33", borderRadius: 8, border: "1px solid #273951" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                                          <span style={{ color: "#ffb4bf", fontWeight: 700 }}>{inc.incident_type.toUpperCase()}</span>
+                                          <span className={`status-badge ${inc.status === "resolved" ? "available" : inc.status === "rejected" ? "unavailable" : "pending"}`}>
+                                            {inc.status}
+                                          </span>
+                                        </div>
+                                        <p style={{ margin: "4px 0", fontSize: 12 }}>{inc.description}</p>
+                                        {inc.resolution_notes && (
+                                          <p className="booking-hint">Resolution notes: “{inc.resolution_notes}”</p>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+
+                                {/* CANCEL REQUEST IF PENDING */}
+                                {booking.status === "pending" && (
+                                  <div style={{ marginTop: 14 }}>
+                                    <button
+                                      type="button"
+                                      className="reject-button"
+                                      onClick={() => updateBookingStatus(booking, "cancelled")}
+                                    >
+                                      <XCircle size={15} /> Cancel Booking Request
+                                    </button>
+                                  </div>
+                                )}
+
+                                {/* AUDITABLE TRANSACTION HISTORY */}
+                                {activities.length > 0 && (
+                                  <div className="history-timeline">
+                                    <strong>Auditable Activity History</strong>
+                                    {activities.map(act => (
+                                      <div key={act.id} className="history-item">
+                                        <span>{new Date(act.created_at).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</span> · {act.action.replaceAll("_", " ")}
+                                        {act.details ? ` — ${act.details}` : ""}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </article>
+                          );
+                        })
+                    )}
+                  </section>
                 )}
 
-                <section className="waitlist-panel" style={{ margin: "24px 0", padding: 20, border: "1px solid var(--border, #dbe4e8)", borderRadius: 18, background: "var(--card, #fff)" }}>
-                  <div className="results-heading">
-                    <h2>Resource waitlists</h2>
-                    <span>{waitlistRequests.length} entries</span>
-                  </div>
-                  {waitlistRequests.filter(item => item.user_id === session.user.id || item.resources?.owner_id === session.user.id || profile.role === "admin").length === 0 ? (
-                    <p className="booking-hint">No waitlist requests yet. If a resource is unavailable for your preferred slot, you can join its waitlist from Discover.</p>
-                  ) : waitlistRequests
-                    .filter(item => item.user_id === session.user.id || item.resources?.owner_id === session.user.id || profile.role === "admin")
-                    .map(item => {
-                      const isRequester = item.user_id === session.user.id;
-                      const isManager = profile.role === "admin" || item.resources?.owner_id === session.user.id;
-                      return (
-                        <article key={item.id} className="booking-card" style={{ marginTop: 12 }}>
-                          <div>
-                            <h3>{item.resources?.title || "Campus resource"}</h3>
-                            <p>{item.resources?.location || "Location unavailable"}</p>
-                            <p>{new Date(item.start_time).toLocaleString()} – {new Date(item.end_time).toLocaleString()}</p>
-                            {item.notes && <p className="booking-notes">{item.notes}</p>}
-                            <span className={`booking-status ${item.status}`}>{item.status}</span>
-                          </div>
-                          <div className="booking-actions">
-                            {isManager && item.status === "waiting" && (
-                              <button type="button" className="approve-button" disabled={waitlistBusy} onClick={() => manageWaitlist(item, "offer")}>Offer this slot</button>
-                            )}
-                            {isRequester && item.status === "offered" && (
-                              <button type="button" className="approve-button" disabled={waitlistBusy} onClick={() => manageWaitlist(item, "accept")}>Accept offer</button>
-                            )}
-                            {isRequester && ["waiting", "offered"].includes(item.status) && (
-                              <button type="button" className="reject-button" disabled={waitlistBusy} onClick={() => manageWaitlist(item, "cancel")}>Cancel waitlist</button>
-                            )}
-                          </div>
-                        </article>
-                      );
-                    })}
-                </section>
+                {/* 2. INCOMING REQUESTS (OWNER INBOX WORKFLOW) */}
+                {bookingTab === "owner" && (
+                  <section>
+                    <div className="results-heading">
+                      <div>
+                        <h2>Requests for My Resources</h2>
+                        <p className="section-subtext">Review borrower eligibility, verify credentials, and approve or reject reservations.</p>
+                      </div>
+                      <span>{ownerBookings.length} total</span>
+                    </div>
 
-                <div className="results-heading">
-                  <h2>Requests for my resources</h2>
-                  <span>
-                    {bookings.filter(
-                      b => b.resources?.owner_id === session.user.id
-                    ).length} requests
-                  </span>
-                </div>
+                    <div className="filter-row" style={{ marginTop: 10, marginBottom: 20 }}>
+                      <span className="filter-label">Filter:</span>
+                      {["all", "pending", "approved", "completed", "rejected"].map((st) => (
+                        <button
+                          key={st}
+                          type="button"
+                          className={`filter-chip ${bookingStatusFilter === st ? "selected" : ""}`}
+                          onClick={() => setBookingStatusFilter(st)}
+                        >
+                          {st === "all" ? "All requests" : st === "pending" ? "Pending (Action Needed)" : st[0].toUpperCase() + st.slice(1)}
+                        </button>
+                      ))}
+                    </div>
 
-                {bookings.filter(
-                  b => b.resources?.owner_id === session.user.id
-                ).length === 0 ? (
-                  <div className="empty-panel">
-                    No one has requested your resources yet.
-                  </div>
-                ) : (
-                  bookings
-                    .filter(b => b.resources?.owner_id === session.user.id)
-                    .map(booking => (
-                      <article className="booking-card" key={`owner-${booking.id}`}>
-                        <div>
-                          <h3>{booking.resources?.title || "Your resource"}</h3>
-                          <p>
-                            Requested by{" "}
-                            {booking.user_id.slice(0, 8)}…
-                          </p>
-                          <span>
-                            {new Date(booking.start_time).toLocaleString()} –{" "}
-                            {new Date(booking.end_time).toLocaleTimeString([], {
-                              hour: "2-digit",
-                              minute: "2-digit"
-                            })}
-                          </span>
-                          {booking.notes && (
-                            <p className="booking-notes">“{booking.notes}”</p>
-                          )}
-                          {incidentReports.filter(item => item.booking_id === booking.id).map(incident => (
-                            <div className="incident-history-item" key={incident.id} style={{ marginTop: 12, padding: 12, border: "1px solid var(--border, #dbe4e8)", borderRadius: 12 }}>
-                              <strong>{incident.incident_type} · {incident.status}</strong>
-                              <p>{incident.description}</p>
-                              {incident.resolution_notes && <p className="booking-hint">Resolution: {incident.resolution_notes}</p>}
-                              {(profile.role === "admin" || booking.resources?.owner_id === session.user.id) && incident.status === "open" && (
-                                <div className="booking-actions">
-                                  <button type="button" className="approve-button" onClick={() => resolveIncident(incident.id, "resolved")}>Resolve report</button>
-                                  <button type="button" className="reject-button" onClick={() => resolveIncident(incident.id, "rejected")}>Reject report</button>
+                    {ownerBookings.filter(b => bookingStatusFilter === "all" || b.status === bookingStatusFilter).length === 0 ? (
+                      <div className="empty-panel">
+                        No {bookingStatusFilter === "all" ? "" : bookingStatusFilter} incoming requests found.
+                      </div>
+                    ) : (
+                      ownerBookings
+                        .filter(b => bookingStatusFilter === "all" || b.status === bookingStatusFilter)
+                        .map((booking) => {
+                          const review = eligibilityReviews.find(r => r.booking_id === booking.id);
+                          const incidents = incidentReports.filter(i => i.booking_id === booking.id);
+                          const activities = bookingActivity.filter(a => a.booking_id === booking.id);
+                          const borrower = profilesMap[booking.user_id];
+                          const hasEligibilityReq = Boolean(booking.resources?.eligibility_requirements?.trim());
+                          const isEligibilityVerified = !hasEligibilityReq || review?.status === "verified";
+                          const isCompleted = booking.status === "completed" || Boolean(booking.check_out_at);
+
+                          return (
+                            <article className="booking-card" key={`owner-${booking.id}`}>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                                  <div>
+                                    <h3>{booking.resources?.title || "Your Resource"}</h3>
+                                    <p className="borrower-identity">
+                                      <UserRound size={14} style={{ display: "inline", verticalAlign: "middle", marginRight: 4 }} />
+                                      <strong>Requested by:</strong> {borrower?.full_name || "Campus User"} ({borrower?.email || booking.user_id.slice(0, 8) + "…"}
+                                      {borrower?.department ? ` · ${borrower.department}` : ""}
+                                      {borrower?.year_of_study ? ` · ${borrower.year_of_study}` : ""})
+                                    </p>
+                                  </div>
+                                  <span className={`booking-status ${isCompleted ? "completed" : booking.status}`}>
+                                    {isCompleted ? "Completed" : booking.status}
+                                  </span>
                                 </div>
-                              )}
-                            </div>
-                          ))}
-                          <div style={{ marginTop: 12 }}>
-                            <strong>Transaction history</strong>
-                            {bookingActivity.filter(item => item.booking_id === booking.id).length ? (
-                              bookingActivity.filter(item => item.booking_id === booking.id).map(item => (
-                                <p className="booking-hint" key={item.id}>
-                                  {new Date(item.created_at).toLocaleString()} · {item.action.replaceAll("_", " ")}
-                                  {item.details ? ` — ${item.details}` : ""}
+
+                                <p className="booking-time-display">
+                                  <CalendarDays size={14} style={{ display: "inline", verticalAlign: "middle", marginRight: 4 }} />
+                                  {new Date(booking.start_time).toLocaleString()} –{" "}
+                                  {new Date(booking.end_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                                 </p>
-                              ))
-                            ) : <p className="booking-hint">No activity recorded yet.</p>}
-                          </div>
-                        </div>
 
-                        <div className="booking-actions">
-                          <span className={`booking-status ${booking.status}`}>
-                            {booking.status}
-                          </span>
+                                {booking.notes && (
+                                  <p className="booking-notes">Borrower message: “{booking.notes}”</p>
+                                )}
 
-                          {booking.status === "pending" && (
-                            <>
-                              <button
-                                className="approve-button"
-                                onClick={() => updateBookingStatus(booking, "approved")}
-                              >
-                                <CheckCircle2 size={15} /> Approve
-                              </button>
+                                {/* OWNER ELIGIBILITY REVIEW PANEL */}
+                                {hasEligibilityReq ? (
+                                  <div className="evidence-panel">
+                                    <div className="evidence-panel-header">
+                                      <div>
+                                        <strong>Eligibility Verification Check</strong>
+                                        <p className="booking-hint">Rule: {booking.resources.eligibility_requirements}</p>
+                                      </div>
+                                      <span className={`status-badge ${review?.status === "verified" ? "available" : review?.status === "rejected" ? "unavailable" : "pending"}`}>
+                                        {review?.status === "verified" ? "✓ Verified" : review?.status === "rejected" ? "✕ Rejected" : "Pending Review"}
+                                      </span>
+                                    </div>
 
-                              <button
-                                className="reject-button"
-                                onClick={() => updateBookingStatus(booking, "rejected")}
-                              >
-                                <XCircle size={15} /> Reject
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </article>
-                    ))
+                                    <div style={{ marginTop: 8 }}>
+                                      <small style={{ color: "#8295ad" }}>Borrower Evidence Submitted:</small>
+                                      <p className="evidence-text">“{review?.evidence_notes || "No evidence text provided."}”</p>
+                                      {review?.review_notes && (
+                                        <p className="booking-hint">Your review notes: “{review.review_notes}”</p>
+                                      )}
+                                    </div>
+
+                                    {/* OWNER CONTROLS: VERIFY OR REJECT ELIGIBILITY */}
+                                    {review && review.status === "pending" && (
+                                      <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                                        <button
+                                          type="button"
+                                          className="approve-button"
+                                          disabled={bookingBusy}
+                                          onClick={() => reviewEligibility(review.id, "verified")}
+                                        >
+                                          <CheckCircle2 size={15} /> Verify Eligibility
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="reject-button"
+                                          disabled={bookingBusy}
+                                          onClick={() => reviewEligibility(review.id, "rejected")}
+                                        >
+                                          <XCircle size={15} /> Reject Eligibility
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <p className="booking-hint" style={{ color: "#7cf3d9", margin: "8px 0" }}>
+                                    ✓ No special eligibility checks required for this resource.
+                                  </p>
+                                )}
+
+                                {/* BEFORE & AFTER CONDITION REPORTS INSPECTION */}
+                                {(booking.check_in_at || booking.check_out_at) && (
+                                  <div className="condition-box" style={{ marginTop: 12 }}>
+                                    <strong>Inspection & Condition Documentation</strong>
+                                    <div className="condition-row">
+                                      <div>
+                                        <small style={{ color: "#8295ad" }}>Initial Condition ({booking.check_in_at ? new Date(booking.check_in_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "N/A"}):</small>
+                                        <p>{booking.initial_condition || "Not recorded yet"}</p>
+                                      </div>
+                                      <div>
+                                        <small style={{ color: "#8295ad" }}>Return Condition ({booking.check_out_at ? new Date(booking.check_out_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "In use"}):</small>
+                                        <p>{booking.return_condition || (booking.check_in_at ? "Resource currently in use by borrower" : "Awaiting check-in")}</p>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* APPROVAL & REJECTION ACTIONS FOR OWNER */}
+                                {booking.status === "pending" && (
+                                  <div className="booking-actions" style={{ marginTop: 16, borderTop: "1px solid #1f354d", paddingTop: 14 }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                                      <button
+                                        type="button"
+                                        className="approve-button"
+                                        disabled={bookingBusy || !isEligibilityVerified}
+                                        title={!isEligibilityVerified ? "Verify borrower eligibility before approving" : "Approve reservation"}
+                                        onClick={() => updateBookingStatus(booking, "approved")}
+                                      >
+                                        <CheckCircle2 size={16} /> Approve Reservation
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        className="reject-button"
+                                        disabled={bookingBusy}
+                                        onClick={() => updateBookingStatus(booking, "rejected")}
+                                      >
+                                        <XCircle size={16} /> Reject Request
+                                      </button>
+
+                                      {!isEligibilityVerified && (
+                                        <span className="warning-badge">
+                                          <AlertTriangle size={15} /> Verify eligibility above before approval
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* OWNER INCIDENT REVIEW & REPORTING */}
+                                {incidents.length > 0 && (
+                                  <div style={{ marginTop: 14 }}>
+                                    <strong style={{ fontSize: 13, color: "#cbd7e5" }}>Incidents Reported on this Booking:</strong>
+                                    {incidents.map(inc => (
+                                      <div key={inc.id} className="incident-card" style={{ marginTop: 8, padding: 12, background: "#0f1f33", borderRadius: 10, border: "1px solid #273951" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                          <strong style={{ color: "#ffb4bf" }}>{inc.incident_type.toUpperCase()}</strong>
+                                          <span className={`status-badge ${inc.status === "resolved" ? "available" : inc.status === "rejected" ? "unavailable" : "pending"}`}>
+                                            {inc.status}
+                                          </span>
+                                        </div>
+                                        <p style={{ margin: "6px 0", fontSize: 13 }}>{inc.description}</p>
+                                        {inc.resolution_notes && (
+                                          <p className="booking-hint">Resolution notes: “{inc.resolution_notes}”</p>
+                                        )}
+                                        {inc.status === "open" && (
+                                          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                                            <button
+                                              type="button"
+                                              className="approve-button"
+                                              style={{ fontSize: 11, padding: "5px 10px" }}
+                                              onClick={() => resolveIncident(inc.id, "resolved")}
+                                            >
+                                              <CheckCircle2 size={13} /> Mark Resolved
+                                            </button>
+                                            <button
+                                              type="button"
+                                              className="reject-button"
+                                              style={{ fontSize: 11, padding: "5px 10px" }}
+                                              onClick={() => resolveIncident(inc.id, "rejected")}
+                                            >
+                                              <XCircle size={13} /> Dismiss Report
+                                            </button>
+                                          </div>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+
+                                {/* OWNER REPORT INCIDENT (e.g. DAMAGE FOUND ON RETURN) */}
+                                {(booking.status === "approved" || isCompleted) && (
+                                  <div style={{ marginTop: 12 }}>
+                                    <button
+                                      type="button"
+                                      className="inline-link"
+                                      style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}
+                                      onClick={() => setIncidentOpen(prev => ({ ...prev, [booking.id]: !prev[booking.id] }))}
+                                    >
+                                      <AlertTriangle size={14} />
+                                      {incidentOpen[booking.id] ? "Close Incident Form" : "Report damage or delay discovered upon return"}
+                                    </button>
+
+                                    {incidentOpen[booking.id] && (
+                                      <div className="evidence-panel" style={{ marginTop: 8 }}>
+                                        <strong>Log Owner Incident Report</strong>
+                                        <label style={{ marginTop: 8 }}>Issue category</label>
+                                        <select
+                                          value={incidentDrafts[booking.id]?.type || "damage"}
+                                          onChange={(e) => setIncidentDrafts(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], type: e.target.value }
+                                          }))}
+                                        >
+                                          <option value="damage">Returned Damaged / Missing Items</option>
+                                          <option value="delay">Overdue / Returned Late Without Notice</option>
+                                          <option value="safety">Improper Handling / Safety Violation</option>
+                                          <option value="other">Other Concern</option>
+                                        </select>
+                                        <label>Report details *</label>
+                                        <textarea
+                                          rows="2"
+                                          value={incidentDrafts[booking.id]?.description || ""}
+                                          onChange={(e) => setIncidentDrafts(prev => ({
+                                            ...prev,
+                                            [booking.id]: { ...prev[booking.id], description: e.target.value }
+                                          }))}
+                                          placeholder="Describe condition upon inspection, damages observed, or missing parts..."
+                                        />
+                                        <button
+                                          type="button"
+                                          className="refresh-button"
+                                          style={{ marginTop: 10 }}
+                                          disabled={bookingBusy}
+                                          onClick={() => reportIncident(booking)}
+                                        >
+                                          Submit Owner Report
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+
+                                {/* AUDITABLE HISTORY */}
+                                {activities.length > 0 && (
+                                  <div className="history-timeline">
+                                    <strong>Activity History</strong>
+                                    {activities.map(act => (
+                                      <div key={act.id} className="history-item">
+                                        <span>{new Date(act.created_at).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</span> · {act.action.replaceAll("_", " ")}
+                                        {act.details ? ` — ${act.details}` : ""}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </article>
+                          );
+                        })
+                    )}
+                  </section>
+                )}
+
+                {/* 3. WAITLIST WORKFLOW */}
+                {bookingTab === "waitlist" && (
+                  <section>
+                    <div className="results-heading">
+                      <div>
+                        <h2>Transparent Resource Waitlists</h2>
+                        <p className="section-subtext">Fair-allocation queue for high-demand campus equipment and spaces.</p>
+                      </div>
+                      <span>{myWaitlist.length + ownerWaitlist.length} active entries</span>
+                    </div>
+
+                    <div style={{ display: "grid", gap: 24, marginTop: 16 }}>
+                      {/* MY WAITLIST SLOTS */}
+                      <div className="evidence-panel">
+                        <h3 style={{ margin: "0 0 12px", fontSize: 16, color: "#20dcc5" }}>My Waitlist Requests</h3>
+                        {myWaitlist.length === 0 ? (
+                          <p className="booking-hint">You are not currently in any resource waitlists. When a resource is booked for your preferred time, you can join its waitlist in Discover.</p>
+                        ) : (
+                          myWaitlist.map(item => (
+                            <article key={item.id} className="booking-card" style={{ marginTop: 10, background: "#0b1c2e" }}>
+                              <div style={{ flex: 1 }}>
+                                <h4>{item.resources?.title || "Campus resource"}</h4>
+                                <p><MapPin size={13} style={{ display: "inline" }} /> {item.resources?.location || "Campus"}</p>
+                                <p>{new Date(item.start_time).toLocaleString()} – {new Date(item.end_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</p>
+                                {item.notes && <p className="booking-notes">“{item.notes}”</p>}
+                                <span className={`booking-status ${item.status}`}>{item.status}</span>
+                              </div>
+                              <div className="booking-actions">
+                                {item.status === "offered" && (
+                                  <button
+                                    type="button"
+                                    className="approve-button"
+                                    disabled={waitlistBusy}
+                                    onClick={() => manageWaitlist(item, "accept")}
+                                  >
+                                    <CheckCircle2 size={15} /> Accept Slot Offer & Book
+                                  </button>
+                                )}
+                                {["waiting", "offered"].includes(item.status) && (
+                                  <button
+                                    type="button"
+                                    className="reject-button"
+                                    disabled={waitlistBusy}
+                                    onClick={() => manageWaitlist(item, "cancel")}
+                                  >
+                                    <XCircle size={15} /> Leave Waitlist
+                                  </button>
+                                )}
+                              </div>
+                            </article>
+                          ))
+                        )}
+                      </div>
+
+                      {/* WAITLISTS FOR MY RESOURCES */}
+                      <div className="evidence-panel">
+                        <h3 style={{ margin: "0 0 12px", fontSize: 16, color: "#20dcc5" }}>Waitlist Queue for My Resources</h3>
+                        {ownerWaitlist.length === 0 ? (
+                          <p className="booking-hint">No borrowers are currently waiting for your resources.</p>
+                        ) : (
+                          ownerWaitlist.map(item => {
+                            const waitingUser = profilesMap[item.user_id];
+                            return (
+                              <article key={item.id} className="booking-card" style={{ marginTop: 10, background: "#0b1c2e" }}>
+                                <div style={{ flex: 1 }}>
+                                  <h4>{item.resources?.title || "Your resource"}</h4>
+                                  <p>Borrower in queue: <strong>{waitingUser?.full_name || "Campus Borrower"}</strong> ({waitingUser?.email || item.user_id.slice(0, 8) + "…"})</p>
+                                  <p>{new Date(item.start_time).toLocaleString()} – {new Date(item.end_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</p>
+                                  {item.notes && <p className="booking-notes">“{item.notes}”</p>}
+                                  <span className={`booking-status ${item.status}`}>{item.status}</span>
+                                </div>
+                                <div className="booking-actions">
+                                  {item.status === "waiting" && (
+                                    <button
+                                      type="button"
+                                      className="approve-button"
+                                      disabled={waitlistBusy}
+                                      onClick={() => manageWaitlist(item, "offer")}
+                                    >
+                                      <Sparkles size={15} /> Offer Slot (FIFO)
+                                    </button>
+                                  )}
+                                  {item.status === "offered" && (
+                                    <span className="booking-hint" style={{ color: "#7cf3d9" }}>Slot offered — awaiting borrower confirmation</span>
+                                  )}
+                                </div>
+                              </article>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </section>
                 )}
               </>
             )}
           </main>
         )}
 
-        {/* ADMIN DASHBOARD */}
+        {/* ADMIN DASHBOARD (RESOURCE APPROVALS & ALL BOOKINGS OVERSIGHT) */}
         {page === "admin" && (
           profile.role === "admin" ? (
             <main className="marketplace admin-page">
@@ -1864,54 +2525,238 @@ function App() {
               </button>
               <div className="welcome-tag"><Shield size={15} /> ACCESSLOOP CONTROL CENTRE</div>
               <h1>Admin <span className="teal">Dashboard.</span></h1>
-              <p className="dashboard-subtitle">Review campus resource submissions and monitor the sharing network.</p>
+              <p className="dashboard-subtitle">Review campus resource submissions and monitor all platform transactions.</p>
 
               <div className="admin-stats-grid">
                 <div className="admin-stat-card"><Package size={22} /><span>Total resources</span><strong>{adminResources.length}</strong></div>
                 <div className="admin-stat-card"><Clock size={22} /><span>Pending review</span><strong>{adminResources.filter(r => r.approval_status === "pending").length}</strong></div>
-                <div className="admin-stat-card"><CheckCircle2 size={22} /><span>Approved</span><strong>{adminResources.filter(r => r.approval_status === "approved").length}</strong></div>
+                <div className="admin-stat-card"><CalendarCheck size={22} /><span>Platform bookings</span><strong>{bookings.length}</strong></div>
                 <div className="admin-stat-card"><Users size={22} /><span>Registered users</span><strong>{adminUserCount}</strong></div>
               </div>
 
-              <div className="admin-list-heading">
-                <div><h2>Resource submissions</h2><p>Approve suitable listings or reject submissions that should not appear in the marketplace.</p></div>
-                <button className="refresh-button" onClick={fetchAdminData}><RefreshCw size={16} /> Refresh</button>
+              {/* ADMIN NAVIGATION TABS */}
+              <div className="admin-tabs">
+                <button
+                  type="button"
+                  className={`admin-tab-btn ${adminTab === "submissions" ? "active" : ""}`}
+                  onClick={() => setAdminTab("submissions")}
+                >
+                  <Package size={17} /> Resource Submissions ({adminResources.filter(r => r.approval_status === "pending").length} pending)
+                </button>
+                <button
+                  type="button"
+                  className={`admin-tab-btn ${adminTab === "bookings" ? "active" : ""}`}
+                  onClick={() => setAdminTab("bookings")}
+                >
+                  <CalendarDays size={17} /> All Bookings Oversight ({bookings.length})
+                </button>
               </div>
-              <div className="filter-row admin-filter-row">
-                {["pending", "approved", "rejected", "all"].map(status => (
-                  <button key={status} className={`filter-chip ${adminFilter === status ? "selected" : ""}`} onClick={() => setAdminFilter(status)}>
-                    {status === "all" ? "All resources" : status[0].toUpperCase() + status.slice(1)}
-                  </button>
-                ))}
-              </div>
+
               {adminError && <div className="error-box">{adminError}</div>}
               {adminMessage && <div className="success-box">{adminMessage}</div>}
-              {adminLoading ? <div className="state-message">Loading admin data...</div> : (
-                <div className="admin-resource-list">
-                  {adminResources.filter(r => adminFilter === "all" || r.approval_status === adminFilter).length === 0 ? (
-                    <div className="empty-panel">No {adminFilter === "all" ? "resources" : adminFilter + " submissions"} found.</div>
-                  ) : adminResources.filter(r => adminFilter === "all" || r.approval_status === adminFilter).map(resource => (
-                    <article className="admin-resource-card" key={resource.id}>
-                      <div className="admin-resource-image">
-                        <ResourceImage src={resource.image_url} alt={resource.title} compact />
-                      </div>
-                      <div className="admin-resource-details">
-                        <div className="admin-resource-title-row"><h3>{resource.title}</h3><span className={`status-badge ${resource.approval_status === "approved" ? "available" : resource.approval_status === "rejected" ? "unavailable" : "pending"}`}>{resource.approval_status}</span></div>
-                        <p>{resource.description || "No description provided."}</p>
-                        <span className="admin-resource-meta"><MapPin size={14} /> {resource.location} · {resource.source || "community"}</span>
-                        <span className="admin-resource-meta">Submitted {resource.created_at ? new Date(resource.created_at).toLocaleDateString() : "date unavailable"}</span>
-                        <div className="admin-resource-actions">
-                          {resource.approval_status !== "approved" && <button className="approve-button" disabled={adminBusyId === resource.id} onClick={() => updateResourceApproval(resource, "approved")}><CheckCircle2 size={15} /> Approve</button>}
-                          {resource.approval_status !== "rejected" && <button className="reject-button" disabled={adminBusyId === resource.id} onClick={() => updateResourceApproval(resource, "rejected")}><XCircle size={15} /> Reject</button>}
-                        </div>
-                      </div>
-                    </article>
-                  ))}
+
+              {/* TAB 1: RESOURCE SUBMISSIONS */}
+              {adminTab === "submissions" && (
+                <div>
+                  <div className="admin-list-heading">
+                    <div>
+                      <h2>Resource Submissions</h2>
+                      <p>Approve suitable campus listings or reject submissions that violate policy.</p>
+                    </div>
+                    <button className="refresh-button" onClick={fetchAdminData}><RefreshCw size={16} /> Refresh</button>
+                  </div>
+
+                  <div className="filter-row admin-filter-row">
+                    {["pending", "approved", "rejected", "all"].map(status => (
+                      <button key={status} className={`filter-chip ${adminFilter === status ? "selected" : ""}`} onClick={() => setAdminFilter(status)}>
+                        {status === "all" ? "All resources" : status[0].toUpperCase() + status.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+
+                  {adminLoading ? <div className="state-message">Loading submissions...</div> : (
+                    <div className="admin-resource-list">
+                      {adminResources.filter(r => adminFilter === "all" || r.approval_status === adminFilter).length === 0 ? (
+                        <div className="empty-panel">No {adminFilter === "all" ? "resources" : adminFilter + " submissions"} found.</div>
+                      ) : adminResources.filter(r => adminFilter === "all" || r.approval_status === adminFilter).map(resource => (
+                        <article className="admin-resource-card" key={resource.id}>
+                          <div className="admin-resource-image">
+                            <ResourceImage src={resource.image_url} alt={resource.title} compact />
+                          </div>
+                          <div className="admin-resource-details">
+                            <div className="admin-resource-title-row">
+                              <h3>{resource.title}</h3>
+                              <span className={`status-badge ${resource.approval_status === "approved" ? "available" : resource.approval_status === "rejected" ? "unavailable" : "pending"}`}>
+                                {resource.approval_status}
+                              </span>
+                            </div>
+                            <p>{resource.description || "No description provided."}</p>
+                            <span className="admin-resource-meta"><MapPin size={14} /> {resource.location} · Source: {resource.source || "student"}</span>
+                            {resource.eligibility_requirements && (
+                              <span className="admin-resource-meta" style={{ color: "#7cf3d9" }}>
+                                <ShieldCheck size={14} /> Eligibility check: {resource.eligibility_requirements}
+                              </span>
+                            )}
+                            <span className="admin-resource-meta">Submitted {resource.created_at ? new Date(resource.created_at).toLocaleDateString() : "date unavailable"}</span>
+                            <div className="admin-resource-actions">
+                              {resource.approval_status !== "approved" && (
+                                <button className="approve-button" disabled={adminBusyId === resource.id} onClick={() => updateResourceApproval(resource, "approved")}>
+                                  <CheckCircle2 size={15} /> Approve Listing
+                                </button>
+                              )}
+                              {resource.approval_status !== "rejected" && (
+                                <button className="reject-button" disabled={adminBusyId === resource.id} onClick={() => updateResourceApproval(resource, "rejected")}>
+                                  <XCircle size={15} /> Reject Listing
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 2: ALL BOOKINGS OVERSIGHT (ADMIN READ-ONLY + INTERVENTION) */}
+              {adminTab === "bookings" && (
+                <div>
+                  <div className="admin-list-heading">
+                    <div>
+                      <h2>All Platform Bookings</h2>
+                      <p>Complete audit log of all reservations, condition reports, and incident resolutions across the institution.</p>
+                    </div>
+                    <button className="refresh-button" onClick={fetchBookings}><RefreshCw size={16} /> Refresh</button>
+                  </div>
+
+                  <div className="search-box" style={{ maxWidth: 450, margin: "14px 0" }}>
+                    <Search size={18} />
+                    <input
+                      placeholder="Search bookings by resource name..."
+                      value={adminSearch}
+                      onChange={(e) => setAdminSearch(e.target.value)}
+                    />
+                    {adminSearch && <button onClick={() => setAdminSearch("")} className="clear-search"><X size={15} /></button>}
+                  </div>
+
+                  <div className="filter-row admin-filter-row">
+                    {["all", "pending", "approved", "completed", "cancelled", "rejected"].map(st => (
+                      <button key={st} className={`filter-chip ${adminBookingFilter === st ? "selected" : ""}`} onClick={() => setAdminBookingFilter(st)}>
+                        {st === "all" ? "All Bookings" : st === "approved" ? "Approved / In Use" : st[0].toUpperCase() + st.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+
+                  {bookings.filter(b => {
+                    const matchStatus = adminBookingFilter === "all" || b.status === adminBookingFilter;
+                    const matchSearch = !adminSearch || (b.resources?.title || "").toLowerCase().includes(adminSearch.toLowerCase());
+                    return matchStatus && matchSearch;
+                  }).length === 0 ? (
+                    <div className="empty-panel">No bookings match the selected criteria.</div>
+                  ) : (
+                    <div style={{ display: "grid", gap: 14, marginTop: 16 }}>
+                      {bookings.filter(b => {
+                        const matchStatus = adminBookingFilter === "all" || b.status === adminBookingFilter;
+                        const matchSearch = !adminSearch || (b.resources?.title || "").toLowerCase().includes(adminSearch.toLowerCase());
+                        return matchStatus && matchSearch;
+                      }).map(b => {
+                        const borrower = profilesMap[b.user_id];
+                        const owner = profilesMap[b.resources?.owner_id];
+                        const review = eligibilityReviews.find(r => r.booking_id === b.id);
+                        const incidents = incidentReports.filter(i => i.booking_id === b.id);
+                        const activities = bookingActivity.filter(a => a.booking_id === b.id);
+                        const isCompleted = b.status === "completed" || Boolean(b.check_out_at);
+
+                        return (
+                          <article key={b.id} className="booking-card" style={{ background: "#0e1f36", border: "1px solid #233b59" }}>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                                <div>
+                                  <h3>{b.resources?.title || "Resource"}</h3>
+                                  <p><MapPin size={13} style={{ display: "inline" }} /> {b.resources?.location || "Campus"}</p>
+                                </div>
+                                <span className={`booking-status ${isCompleted ? "completed" : b.status}`}>
+                                  {isCompleted ? "Completed" : b.status}
+                                </span>
+                              </div>
+
+                              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, margin: "10px 0", fontSize: 12 }}>
+                                <div>
+                                  <strong style={{ color: "#20dcc5" }}>Borrower:</strong> {borrower?.full_name || "Borrower"} ({borrower?.email || b.user_id.slice(0, 8) + "…"} · {borrower?.department || "Student"})
+                                </div>
+                                <div>
+                                  <strong style={{ color: "#20dcc5" }}>Owner:</strong> {owner?.full_name || "Owner"} ({owner?.email || b.resources?.owner_id?.slice(0, 8) + "…"})
+                                </div>
+                              </div>
+
+                              <p className="booking-time-display">
+                                <CalendarDays size={14} style={{ display: "inline", marginRight: 4 }} />
+                                {new Date(b.start_time).toLocaleString()} – {new Date(b.end_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                              </p>
+
+                              {review && (
+                                <div className="evidence-panel" style={{ marginTop: 8 }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                                    <strong>Eligibility status: {review.status}</strong>
+                                    {review.reviewed_at && <small>{new Date(review.reviewed_at).toLocaleDateString()}</small>}
+                                  </div>
+                                  <p className="evidence-text">Evidence: “{review.evidence_notes}”</p>
+                                  {review.review_notes && <p className="booking-hint">Review note: “{review.review_notes}”</p>}
+                                </div>
+                              )}
+
+                              {(b.check_in_at || b.check_out_at) && (
+                                <div className="condition-box" style={{ marginTop: 8 }}>
+                                  <strong>Documented Condition Inspection</strong>
+                                  <div className="condition-row">
+                                    <div>
+                                      <small>Initial ({b.check_in_at ? new Date(b.check_in_at).toLocaleTimeString() : "N/A"}):</small>
+                                      <p>{b.initial_condition || "Not recorded"}</p>
+                                    </div>
+                                    <div>
+                                      <small>Return ({b.check_out_at ? new Date(b.check_out_at).toLocaleTimeString() : "N/A"}):</small>
+                                      <p>{b.return_condition || "Not recorded"}</p>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+
+                              {incidents.length > 0 && (
+                                <div style={{ marginTop: 8 }}>
+                                  <strong style={{ color: "#ffb4bf", fontSize: 12 }}>Incidents ({incidents.length}):</strong>
+                                  {incidents.map(inc => (
+                                    <div key={inc.id} style={{ marginTop: 4, padding: 8, background: "#14253d", borderRadius: 8 }}>
+                                      <span><strong>{inc.incident_type}</strong> · {inc.status} — {inc.description}</span>
+                                      {inc.resolution_notes && <p className="booking-hint">Resolution: {inc.resolution_notes}</p>}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {activities.length > 0 && (
+                                <div className="history-timeline" style={{ marginTop: 10 }}>
+                                  <strong>Activity Trail ({activities.length} events)</strong>
+                                  {activities.slice(0, 3).map(act => (
+                                    <div key={act.id} className="history-item">
+                                      <span>{new Date(act.created_at).toLocaleTimeString()}</span> · {act.action.replaceAll("_", " ")}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </main>
           ) : (
-            <main className="marketplace"><div className="error-box">You do not have permission to access the admin dashboard.</div><button className="back-button" onClick={() => setPage("home")}>Back to Home</button></main>
+            <main className="marketplace">
+              <div className="error-box">You do not have administrator permissions to access this control centre.</div>
+              <button className="back-button" onClick={() => setPage("home")}>Back to Home</button>
+            </main>
           )
         )}
 
@@ -1958,7 +2803,7 @@ function App() {
                 <form className="resource-form profile-form" onSubmit={saveProfile}>
                   <h2>Edit profile</h2>
                   <p className="profile-form-note">
-                    Your email and account role are managed securely and cannot be edited here.
+                    Your institutional email and account role are managed securely and cannot be edited here.
                   </p>
 
                   <label>Full name *</label>
@@ -1995,6 +2840,7 @@ function App() {
                     <option value="3rd Year">3rd Year</option>
                     <option value="4th Year">4th Year</option>
                     <option value="Postgraduate">Postgraduate</option>
+                    <option value="Faculty / Staff">Faculty / Staff</option>
                     <option value="Other">Other</option>
                   </select>
 
@@ -2004,7 +2850,7 @@ function App() {
                     rows="4"
                     value={profile.bio}
                     onChange={handleProfileChange}
-                    placeholder="A little about yourself and your interests..."
+                    placeholder="A little about yourself and your academic or research interests..."
                     maxLength="300"
                   />
 
@@ -2030,7 +2876,7 @@ function App() {
           </main>
         )}
 
-        {/* RESOURCE DETAILS + BOOKING FORM */}
+        {/* RESOURCE DETAILS + BOOKING FORM MODAL */}
         {selectedResource && (
           <div className="modal-backdrop" onClick={() => setSelectedResource(null)}>
             <div className="resource-modal" onClick={e => e.stopPropagation()}>
@@ -2050,13 +2896,26 @@ function App() {
                   <MapPin size={17} /> {selectedResource.location}
                 </div>
 
-                <div className="approval-note">
-                  <ShieldCheck size={17} />
-                  Approval status: {selectedResource.approval_status}
+                {selectedResource.usage_rules && (
+                  <div className="approval-note">
+                    <Info size={17} />
+                    <span><strong>Usage rules:</strong> {selectedResource.usage_rules}</span>
+                  </div>
+                )}
+
+                {selectedResource.eligibility_requirements && (
+                  <div className="approval-note" style={{ borderColor: "rgba(32,220,197,.3)" }}>
+                    <ShieldCheck size={17} />
+                    <span><strong>Eligibility required:</strong> {selectedResource.eligibility_requirements}</span>
+                  </div>
+                )}
+
+                <div className="approval-note" style={{ background: "#071729", border: "1px dashed #244161" }}>
+                  <Sparkles size={16} />
+                  <span>
+                    <strong>Fair usage limits:</strong> Maximum reservation duration: {selectedResource.max_booking_hours || 4} hour(s) · Maximum {selectedResource.max_active_bookings || 2} active bookings per borrower.
+                  </span>
                 </div>
-                {selectedResource.usage_rules && <div className="approval-note"><Info size={17} /><span><strong>Usage rules:</strong> {selectedResource.usage_rules}</span></div>}
-                {selectedResource.eligibility_requirements && <div className="approval-note"><ShieldCheck size={17} /><span><strong>Eligibility:</strong> {selectedResource.eligibility_requirements}</span></div>}
-                <p className="booking-hint">Maximum duration: {selectedResource.max_booking_hours || 4} hour(s) · Active bookings per user: {selectedResource.max_active_bookings || 2}</p>
 
                 {selectedResource.approval_status === "approved" &&
                 isAvailable(selectedResource.availability_status) &&
@@ -2064,7 +2923,7 @@ function App() {
                   <form className="booking-form" onSubmit={submitBooking}>
                     <h3><CalendarCheck size={19} /> Request this resource</h3>
                     <p className="booking-hint">
-                      Monday–Saturday, 9 AM–3 PM.
+                      Booking window: Monday–Saturday, 9:00 AM–3:00 PM.
                     </p>
 
                     <label>Booking date</label>
@@ -2104,9 +2963,17 @@ function App() {
 
                     {selectedResource.eligibility_requirements?.trim() && (
                       <>
-                        <label>Eligibility information (required)</label>
-                        <p className="booking-hint">Explain how you meet the resource requirements. The owner or administrator will review this before approval.</p>
-                        <textarea rows="3" value={eligibilityEvidence} onChange={e => setEligibilityEvidence(e.target.value)} placeholder="Describe your qualification, training, membership or authorisation..." required />
+                        <label>Eligibility statement & evidence (required) *</label>
+                        <p className="booking-hint">
+                          Explain how you satisfy the requirements: “{selectedResource.eligibility_requirements}”. The owner will verify this before approval.
+                        </p>
+                        <textarea
+                          rows="3"
+                          value={eligibilityEvidence}
+                          onChange={e => setEligibilityEvidence(e.target.value)}
+                          placeholder="e.g. Completed Lab Safety training (Cert #8291), member of robotics club, enrolled in EEE 301..."
+                          required
+                        />
                       </>
                     )}
 
@@ -2115,25 +2982,36 @@ function App() {
                       rows="3"
                       value={bookingNotes}
                       onChange={e => setBookingNotes(e.target.value)}
-                      placeholder="Tell the owner what you need it for..."
+                      placeholder="Explain what project or assignment you need it for..."
                     />
 
                     {bookingError && <div className="error-box">{bookingError}</div>}
                     {bookingMessage && <div className="success-box">{bookingMessage}</div>}
 
                     <button className="submit-button" disabled={bookingBusy}>
-                      {bookingBusy ? "Sending..." : "Send booking request"}
+                      {bookingBusy ? "Submitting request..." : "Send reservation request"}
                       <ArrowRight size={17} />
                     </button>
-                    <button type="button" className="refresh-button" disabled={waitlistBusy || !bookingDate || !bookingStart || !bookingEnd} onClick={() => joinWaitlist(selectedResource)}>
-                      {waitlistBusy ? "Joining..." : "Join waitlist for this slot"}
-                    </button>
+
+                    <div style={{ marginTop: 12, textAlign: "center" }}>
+                      <span className="booking-hint">If this slot becomes reserved or has competing demand:</span>
+                      <button
+                        type="button"
+                        className="refresh-button"
+                        style={{ width: "100%", justifyContent: "center", marginTop: 6 }}
+                        disabled={waitlistBusy || !bookingDate || !bookingStart || !bookingEnd}
+                        onClick={() => joinWaitlist(selectedResource)}
+                      >
+                        <Clock size={15} />
+                        {waitlistBusy ? "Joining..." : "Join transparent waitlist for this slot"}
+                      </button>
+                    </div>
                   </form>
                 ) : (
-                  <p className="reservation-note">
+                  <p className="reservation-note" style={{ color: "#ffb4bf" }}>
                     {selectedResource.owner_id === session.user.id
-                      ? "You cannot book your own resource."
-                      : "This resource is not currently available for booking."}
+                      ? "You are the owner of this resource and cannot submit a booking request for it."
+                      : "This resource is currently marked as unavailable for reservations."}
                   </p>
                 )}
               </div>
@@ -2151,7 +3029,7 @@ function App() {
 
               <div className="modal-content">
                 <h2>Edit listing</h2>
-                <p>Changes to an approved listing will require admin review again.</p>
+                <p>Changes to an approved listing will require administrative review again.</p>
 
                 <form className="resource-form compact-form" onSubmit={saveEditedResource}>
                   <label>Resource name *</label>
@@ -2179,19 +3057,28 @@ function App() {
                     <option value="available">Available</option>
                     <option value="unavailable">Unavailable</option>
                   </select>
+
                   <label>Usage rules</label>
                   <textarea name="usage_rules" rows="2" value={resourceForm.usage_rules} onChange={handleResourceFormChange} />
+
                   <label>Eligibility requirements</label>
                   <textarea name="eligibility_requirements" rows="2" value={resourceForm.eligibility_requirements} onChange={handleResourceFormChange} />
+
                   <div className="time-fields">
-                    <div><label>Max active bookings per user</label><input type="number" min="1" max="20" name="max_active_bookings" value={resourceForm.max_active_bookings} onChange={handleResourceFormChange} /></div>
-                    <div><label>Maximum booking hours</label><input type="number" min="1" max="24" name="max_booking_hours" value={resourceForm.max_booking_hours} onChange={handleResourceFormChange} /></div>
+                    <div>
+                      <label>Max active bookings per user</label>
+                      <input type="number" min="1" max="20" name="max_active_bookings" value={resourceForm.max_active_bookings} onChange={handleResourceFormChange} />
+                    </div>
+                    <div>
+                      <label>Maximum booking hours</label>
+                      <input type="number" min="1" max="24" name="max_booking_hours" value={resourceForm.max_booking_hours} onChange={handleResourceFormChange} />
+                    </div>
                   </div>
 
                   {formError && <div className="error-box">{formError}</div>}
 
                   <button className="submit-button" disabled={formBusy}>
-                    {formBusy ? "Saving..." : "Save changes"}
+                    {formBusy ? "Saving..." : "Save changes for review"}
                   </button>
                 </form>
               </div>
@@ -2231,7 +3118,7 @@ function App() {
         )}
 
         <footer className="footer">
-          © 2026 AccessLoop · Making campus resources accessible.
+          © 2026 AccessLoop · Safe, accountable, and fair campus resource sharing.
         </footer>
       </div>
     </>
@@ -2351,6 +3238,13 @@ button { cursor: pointer; }
   line-height: 1.9;
   font-size: 16px;
   max-width: 490px;
+}
+
+.section-subtext {
+  color: #9aabc1;
+  font-size: 13px;
+  margin: 4px 0 0;
+  line-height: 1.6;
 }
 
 .feature-list {
@@ -2494,8 +3388,8 @@ button { cursor: pointer; }
   line-height: 1.6;
 }
 
-.error-box { background: #451d2a; color: #ffb5c1; }
-.success-box { background: #123c37; color: #7cf3d9; }
+.error-box { background: #451d2a; color: #ffb5c1; border: 1px solid #7c2d3a; }
+.success-box { background: #123c37; color: #7cf3d9; border: 1px solid #23655b; }
 
 .secure-note {
   display: flex;
@@ -2528,24 +3422,20 @@ button { cursor: pointer; }
 }
 
 .dashboard-content, .marketplace {
-  width: min(1050px, 90%);
-  margin: 70px auto;
-}
-
-.dashboard-content h1, .marketplace h1 {
-  font-size: clamp(36px,5vw,55px);
+  width: min(1100px, 92%);
+  margin: 50px auto;
 }
 
 .dashboard-grid {
   display: grid;
   grid-template-columns: repeat(2,1fr);
   gap: 20px;
-  margin-top: 45px;
+  margin-top: 40px;
 }
 
 .dashboard-card {
   text-align: left;
-  padding: 30px;
+  padding: 28px;
   background: #112036;
   border: 1px solid #273951;
   border-radius: 17px;
@@ -2554,7 +3444,7 @@ button { cursor: pointer; }
 }
 
 button.dashboard-card:hover {
-  transform: translateY(-5px);
+  transform: translateY(-4px);
   border-color: #20dcc5;
 }
 
@@ -2578,7 +3468,7 @@ button.dashboard-card:hover {
   color: #20dcc5;
   font-size: 13px;
   font-weight: 700;
-  margin-top: 22px;
+  margin-top: 20px;
 }
 
 .coming-soon {
@@ -2594,12 +3484,200 @@ button.dashboard-card:hover {
   font-size: 13px;
 }
 
+/* BOOKING SUBTABS */
+.booking-subtabs {
+  display: flex;
+  gap: 12px;
+  margin: 25px 0 10px;
+  border-bottom: 1px solid rgba(255,255,255,.09);
+  padding-bottom: 14px;
+  overflow-x: auto;
+}
+
+.booking-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 18px;
+  border-radius: 12px;
+  border: 1px solid #30435a;
+  background: #112036;
+  color: #9aabc1;
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.booking-tab-btn:hover {
+  border-color: #20dcc5;
+  color: #f8fafc;
+}
+
+.booking-tab-btn.active {
+  background: rgba(32,220,197,.12);
+  border-color: #20dcc5;
+  color: #20dcc5;
+}
+
+.tab-pill {
+  padding: 2px 7px;
+  border-radius: 12px;
+  background: #1b3449;
+  font-size: 11px;
+  color: #cbd7e5;
+}
+
+.tab-alert-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: #b45309;
+  color: #fef3c7;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+}
+
+.evidence-panel {
+  margin: 14px 0;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: #09182a;
+  border: 1px solid #273951;
+}
+
+.evidence-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.evidence-text {
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 6px 0 8px;
+}
+
+.condition-card {
+  margin: 14px 0;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: #0d1e33;
+  border: 1px solid #1e3a5f;
+}
+
+.condition-card h4 {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #20dcc5;
+  font-size: 14px;
+}
+
+.condition-box {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #081628;
+  border: 1px solid #1d334d;
+}
+
+.condition-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 8px;
+}
+
+.warning-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #fbbf24;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(245,158,11,.1);
+  border: 1px solid rgba(245,158,11,.25);
+}
+
+.admin-tabs {
+  display: flex;
+  gap: 12px;
+  margin: 25px 0 15px;
+  border-bottom: 1px solid rgba(255,255,255,.09);
+  padding-bottom: 14px;
+}
+
+.admin-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 11px;
+  border: 1px solid #30435a;
+  background: #112036;
+  color: #9aabc1;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.admin-tab-btn.active {
+  background: rgba(32,220,197,.12);
+  border-color: #20dcc5;
+  color: #20dcc5;
+}
+
+.history-timeline {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 10px;
+  background: #09182a;
+  border: 1px solid #1d334d;
+  font-size: 12px;
+}
+
+.history-timeline strong {
+  display: block;
+  color: #9aabc1;
+  margin-bottom: 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.history-item {
+  color: #8295ad;
+  margin: 4px 0;
+  line-height: 1.5;
+}
+
+.history-item span {
+  color: #20dcc5;
+  font-weight: 600;
+}
+
+.borrower-identity {
+  color: #cbd7e5 !important;
+  font-size: 13px !important;
+  margin: 4px 0 6px !important;
+}
+
+.booking-time-display {
+  color: #a8b9cc !important;
+  font-size: 13px !important;
+  margin: 6px 0 !important;
+}
+
 .admin-stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 15px;
-  margin: 30px 0 38px;
+  margin: 30px 0 25px;
 }
+
 .admin-stat-card {
   background: #112036;
   border: 1px solid #273951;
@@ -2608,6 +3686,7 @@ button.dashboard-card:hover {
   display: grid;
   gap: 9px;
 }
+
 .admin-stat-card svg { color: #20dcc5; }
 .admin-stat-card span { color: #9aabc1; font-size: 12px; }
 .admin-stat-card strong { font: 700 29px 'Space Grotesk', sans-serif; }
@@ -2625,12 +3704,6 @@ button.dashboard-card:hover {
 .admin-resource-meta { display: flex; align-items: center; gap: 6px; color: #91a2b9; font-size: 11px; margin-top: 6px; }
 .admin-resource-actions { display: flex; gap: 9px; margin-top: 13px; }
 .admin-resource-actions button:disabled { opacity: .55; cursor: wait; }
-@media (max-width: 760px) {
-  .admin-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .admin-resource-card { grid-template-columns: 1fr; }
-  .admin-resource-image { max-height: 180px; }
-  .admin-list-heading { align-items: flex-start; flex-direction: column; }
-}
 
 .profile-nav-button {
   display: flex;
@@ -2732,7 +3805,7 @@ button.dashboard-card:hover {
   background: transparent;
   border: 0;
   padding: 0;
-  margin-bottom: 35px;
+  margin-bottom: 30px;
 }
 
 .back-button:hover { color: #20dcc5; }
@@ -2744,7 +3817,7 @@ button.dashboard-card:hover {
   gap: 20px;
 }
 
-.market-heading h1 { margin-top: 20px; }
+.market-heading h1 { margin-top: 15px; }
 
 .resource-count {
   display: flex;
@@ -2762,7 +3835,7 @@ button.dashboard-card:hover {
 .resource-count svg { color: #20dcc5; }
 
 .search-panel {
-  margin: 35px 0;
+  margin: 30px 0 35px;
   padding: 20px;
   background: #112036;
   border: 1px solid #273951;
@@ -2770,7 +3843,7 @@ button.dashboard-card:hover {
 }
 
 .search-box {
-  height: 53px;
+  height: 51px;
   padding: 0 15px;
   display: flex;
   align-items: center;
@@ -2800,7 +3873,7 @@ button.dashboard-card:hover {
   flex-wrap: wrap;
   align-items: center;
   gap: 10px;
-  margin-top: 17px;
+  margin-top: 15px;
 }
 
 .filter-label {
@@ -2814,7 +3887,7 @@ button.dashboard-card:hover {
 .filter-chip {
   border: 1px solid #30435a;
   border-radius: 20px;
-  padding: 8px 14px;
+  padding: 7px 14px;
   background: transparent;
   color: #9aabc1;
   font-size: 12px;
@@ -2842,7 +3915,7 @@ button.dashboard-card:hover {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin: 35px 0 18px;
+  margin: 30px 0 16px;
 }
 
 .results-heading h2 {
@@ -2908,7 +3981,7 @@ button.dashboard-card:hover {
 
 .status-badge {
   display: inline-flex;
-  padding: 6px 10px;
+  padding: 5px 10px;
   border-radius: 20px;
   font-size: 10px;
   font-weight: 700;
@@ -2956,7 +4029,7 @@ button.dashboard-card:hover {
   gap: 7px;
   color: #8295ad;
   font-size: 12px;
-  margin: 17px 0;
+  margin: 15px 0;
 }
 
 .resource-location svg { color: #20dcc5; flex-shrink: 0; }
@@ -2982,7 +4055,7 @@ button.dashboard-card:hover {
 }
 
 .state-message {
-  min-height: 200px;
+  min-height: 180px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2991,12 +4064,13 @@ button.dashboard-card:hover {
 }
 
 .empty-panel {
-  padding: 25px;
+  padding: 30px;
   border: 1px dashed #30435a;
-  border-radius: 12px;
+  border-radius: 14px;
   color: #9aabc1;
   font-size: 13px;
   margin: 20px 0;
+  text-align: center;
 }
 
 .inline-link {
@@ -3023,7 +4097,7 @@ button.dashboard-card:hover {
 
 .resource-form input, .resource-form textarea,
 .resource-form select, .booking-form input,
-.booking-form textarea {
+.booking-form textarea, .evidence-panel select {
   width: 100%;
   border: 1px solid #30435a;
   background: #09182a;
@@ -3050,7 +4124,7 @@ button.dashboard-card:hover {
   align-items: center;
   gap: 9px;
   padding: 13px;
-  margin-top: 20px;
+  margin-top: 16px;
   border-radius: 9px;
   background: #0b1b30;
   color: #a9c9ca;
@@ -3110,9 +4184,9 @@ button.dashboard-card:hover {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  z-index: 100;
   padding: 20px;
-  background: rgba(0,0,0,.75);
+  background: rgba(0,0,0,.78);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3120,7 +4194,7 @@ button.dashboard-card:hover {
 }
 
 .resource-modal {
-  width: min(520px,100%);
+  width: min(540px,100%);
   max-height: 90vh;
   overflow-y: auto;
   background: #112036;
@@ -3144,12 +4218,6 @@ button.dashboard-card:hover {
   color: white;
   display: grid;
   place-items: center;
-}
-
-.modal-image {
-  width: 100%;
-  height: 230px;
-  object-fit: cover;
 }
 
 .modal-content { padding: 25px; }
@@ -3193,7 +4261,7 @@ button.dashboard-card:hover {
   margin: 0;
 }
 
-.booking-hint { margin: 0 !important; }
+.booking-hint { margin: 0 !important; font-size: 12px; color: #8295ad; }
 
 .time-fields {
   display: grid;
@@ -3214,16 +4282,21 @@ button.dashboard-card:hover {
   justify-content: space-between;
   align-items: flex-start;
   gap: 18px;
-  margin: 12px 0;
-  padding: 20px;
+  margin: 14px 0;
+  padding: 22px;
   border: 1px solid #273951;
-  border-radius: 13px;
+  border-radius: 15px;
   background: #112036;
 }
 
 .booking-card h3 {
-  margin: 0 0 7px;
-  font: 600 17px 'Space Grotesk', sans-serif;
+  margin: 0 0 6px;
+  font: 600 18px 'Space Grotesk', sans-serif;
+}
+
+.booking-card h4 {
+  margin: 0 0 6px;
+  font: 600 16px 'Space Grotesk', sans-serif;
 }
 
 .booking-card p, .booking-card span {
@@ -3233,12 +4306,12 @@ button.dashboard-card:hover {
 }
 
 .booking-card p { margin: 3px 0; }
-.booking-notes { color: #cbd7e5 !important; }
+.booking-notes { color: #cbd7e5 !important; font-style: italic; }
 
 .booking-status {
   display: inline-flex;
   border-radius: 20px;
-  padding: 7px 11px;
+  padding: 6px 12px;
   font-size: 11px;
   font-weight: 700;
   text-transform: capitalize;
@@ -3257,6 +4330,12 @@ button.dashboard-card:hover {
   color: #7cf3d9;
 }
 
+.booking-status.completed {
+  background: #0f403b;
+  color: #20dcc5;
+  border: 1px solid rgba(32,220,197,.3);
+}
+
 .booking-status.rejected, .booking-status.cancelled {
   background: #462c32;
   color: #ffb4bf;
@@ -3266,8 +4345,8 @@ button.dashboard-card:hover {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 10px;
 }
 
 .approve-button, .reject-button {
@@ -3275,8 +4354,8 @@ button.dashboard-card:hover {
   align-items: center;
   gap: 6px;
   border-radius: 8px;
-  padding: 8px 11px;
-  font-size: 11px;
+  padding: 9px 13px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -3329,8 +4408,6 @@ button.dashboard-card:hover {
 
 .confirm-actions .delete-button { border: 1px solid #81424f; }
 
-
-
 /* NOTIFICATION CENTRE */
 .notification-wrap {
   position: relative;
@@ -3375,7 +4452,7 @@ button.dashboard-card:hover {
 
 .notification-panel {
   position: absolute;
-  z-index: 20;
+  z-index: 100;
   top: calc(100% + 13px);
   right: 0;
   width: min(390px, calc(100vw - 30px));
@@ -3514,7 +4591,7 @@ button.dashboard-card:hover {
   .auth-layout {
     grid-template-columns: 1fr;
     gap: 35px;
-    padding: 55px 0;
+    padding: 40px 0;
   }
 
   .hero-section h1 { font-size: 43px; }
@@ -3542,7 +4619,7 @@ button.dashboard-card:hover {
   .auth-card { padding: 25px; }
 
   .dashboard-content, .marketplace {
-    margin: 45px auto;
+    margin: 35px auto;
   }
 
   .dashboard-grid, .resource-grid {
@@ -3557,13 +4634,13 @@ button.dashboard-card:hover {
   .filter-row { gap: 8px; }
   .search-panel { padding: 13px; }
 
-  .marketplace h1 { font-size: 39px; }
+  .marketplace h1 { font-size: 36px; }
 
   .time-fields { grid-template-columns: 1fr; }
   .resource-form { padding: 20px; }
+  .condition-row { grid-template-columns: 1fr; }
 }
 
-/* PHASE 7 — PRODUCT POLISH */
 :root { color-scheme: dark; }
 html { scroll-behavior: smooth; }
 body { min-width: 320px; }
@@ -3577,9 +4654,8 @@ button:disabled { opacity: .58; cursor: not-allowed; transform: none !important;
 .dashboard-grid { gap: 18px; }
 .dashboard-card { min-height: 162px; padding: 26px; border-radius: 18px; background: linear-gradient(145deg, rgba(20,39,64,.98), rgba(15,31,52,.98)); border: 1px solid rgba(120,157,190,.19); text-align: left; }
 .dashboard-card:hover { border-color: rgba(32,220,197,.65); box-shadow: 0 16px 36px rgba(0,0,0,.2); transform: translateY(-4px); }
-.market-heading { margin-bottom: 26px; }
+.market-heading { margin-bottom: 24px; }
 .search-panel { border: 1px solid rgba(120,157,190,.2); box-shadow: 0 14px 34px rgba(0,0,0,.12); }
-.search-box input { min-width: 0; }
 .market-select { min-height: 38px; padding: 0 12px; border-radius: 9px; border: 1px solid #30435a; color: #dbe5f1; background: #0b1b30; font-size: 12px; }
 .market-select:focus { border-color: #20dcc5; }
 .resource-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 22px; }
@@ -3645,13 +4721,12 @@ button:disabled { opacity: .58; cursor: not-allowed; transform: none !important;
   .resource-info { min-height: auto; }
   .resource-info .details-button { margin-top: 12px; }
   .market-heading { gap: 14px; }
-  .marketplace h1, .dashboard-content h1 { font-size: 36px; }
+  .marketplace h1, .dashboard-content h1 { font-size: 34px; }
   .notification-panel { position: fixed; top: 75px; left: 4%; right: 4%; width: auto; max-height: 70vh; }
   .auth-layout { width: 92%; }
   .auth-card { padding: 22px; }
   .time-fields { grid-template-columns: 1fr; }
 }
-
 `;
 
 export default App;
