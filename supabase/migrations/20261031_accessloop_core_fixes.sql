@@ -7,7 +7,8 @@
 -- 3. Prevents borrowers from approving/rejecting their own bookings (even if admin).
 -- 4. Prevents borrowers from reviewing/verifying their own eligibility (even if admin).
 -- 5. Implements missing waitlist RPCs: offer_waitlist_slot, accept_waitlist_offer, cancel_waitlist_request.
--- 6. Tightens bookings update security to protect lifecycle fields.
+-- 6. Fixes resources INSERT RLS policy to allow admins and students to create listings without policy violation.
+-- 7. Fixes profiles INSERT RLS and ensures auth trigger + backfill so all users have valid profiles.
 -- ============================================================================
 
 -- 1. Allow 'approved' -> 'completed' transition
@@ -468,7 +469,79 @@ BEGIN
 END;
 $function$;
 
--- Grant execute permissions to authenticated users on new RPCs
+-- 6. Profiles Insertion Policy, Trigger & Backfill
+-- Ensure authenticated users can insert their own student profile row if missing
+DROP POLICY IF EXISTS "Users can insert their own profile" ON public.profiles;
+CREATE POLICY "Users can insert their own profile"
+ON public.profiles
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  user_id = (SELECT auth.uid() AS uid)
+  AND role = 'student'::text
+);
+
+-- Ensure the trigger on auth.users is active
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- Backfill any existing auth users missing from public.profiles
+INSERT INTO public.profiles (user_id, email, role)
+SELECT id, email, 'student'
+FROM auth.users
+WHERE id NOT IN (SELECT user_id FROM public.profiles)
+ON CONFLICT (user_id) DO NOTHING;
+
+-- 7. Fix Resources INSERT RLS Policy
+-- Resolves "new row violates row-level security policy for table resources"
+-- Allows students to create student listings (pending approval),
+-- and allows admins to create listings (either 'student' or 'college' source, pending or approved).
+DROP POLICY IF EXISTS "Students and admins can create listings" ON public.resources;
+
+CREATE POLICY "Students and admins can create listings"
+ON public.resources
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  owner_id = (SELECT auth.uid() AS uid)
+  AND (
+    -- 7A. Student user creating student listing awaiting admin approval
+    (
+      source = 'student'::text
+      AND approval_status = 'pending'::text
+      AND EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE profiles.user_id = (SELECT auth.uid() AS uid)
+          AND profiles.role = 'student'::text
+      )
+    )
+    OR
+    -- 7B. Admin user creating resource (college or student source, pending or approved)
+    (
+      source = ANY (ARRAY['student'::text, 'college'::text])
+      AND approval_status = ANY (ARRAY['pending'::text, 'approved'::text])
+      AND EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE profiles.user_id = (SELECT auth.uid() AS uid)
+          AND profiles.role = 'admin'::text
+      )
+    )
+    OR
+    -- 7C. Resilience fallback if profile row has not yet synchronized:
+    (
+      source = 'student'::text
+      AND approval_status = 'pending'::text
+      AND NOT EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE profiles.user_id = (SELECT auth.uid() AS uid)
+      )
+    )
+  )
+);
+
+-- Grant execute permissions to authenticated users on all RPCs
 GRANT EXECUTE ON FUNCTION public.offer_waitlist_slot(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.accept_waitlist_offer(uuid) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.cancel_waitlist_request(uuid) TO authenticated;
