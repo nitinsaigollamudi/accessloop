@@ -1703,7 +1703,7 @@ function App() {
                               <strong>Eligibility review · {review.status}</strong>
                               <p>{review.evidence_notes}</p>
                               {review.review_notes && <p className="booking-hint">Review notes: {review.review_notes}</p>}
-                              {review.status === "pending" && (
+                              {review.status === "pending" && (booking.resources?.owner_id === session.user.id || profile.role === "admin") && (
                                 <div className="booking-actions">
                                   <button type="button" className="approve-button" disabled={bookingBusy} onClick={() => reviewEligibility(review.id, "verified")}>Verify eligibility</button>
                                   <button type="button" className="reject-button" disabled={bookingBusy} onClick={() => reviewEligibility(review.id, "rejected")}>Reject eligibility</button>
